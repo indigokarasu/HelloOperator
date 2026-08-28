@@ -133,7 +133,7 @@ The router must never be the component that kills an unattended run:
 | Embedding model down | `default_role` + capability filter; request proceeds |
 | Every model filtered out | Clear error naming the constraint |
 | Affinity lost (restart) | Reclassify; one re-prefill per active session |
-| Backend unreachable | Next cascade position, then any eligible model; logged |
+| Backend unreachable | Next cascade position, then any eligible model within the role's locality fence; logged |
 
 ## Observability
 
@@ -152,6 +152,39 @@ Pin a session for debugging with the `x-router-pin: <model-key>` header (or by
 naming a registered model directly in the `model` field). Pins never bypass
 the capability filter. Frequent pinning is a routing-failure signal — the
 design goal is zero pins in normal operation.
+
+## Mixing cloud and local models
+
+Any OpenAI-compatible endpoint can be a registry entry — including hosted
+ones (OpenRouter, OpenAI, Anthropic's compatibility endpoint). Three rules
+keep the mix honest:
+
+1. **Remote is an explicit opt-in.** Every model resolves a `location`
+   (`local` | `remote`) — declared, else inferred from the endpoint host
+   (loopback, RFC-1918, `.local`/`.lan` → local). If anything resolves
+   remote, the router refuses to start until you set
+   `router.allow_remote_endpoints: true`, and then says at startup exactly
+   which models' traffic leaves the machine. A tailnet host that *looks*
+   remote can be declared `location: local` — declarations win.
+2. **Role locality is a fence failover cannot cross.** A role with
+   `locality: local` accepts only local models in its cascade (validated at
+   startup), and a session routed under it will never fail over to a remote
+   model — not even through another role's cascade. Privacy follows the
+   conversation, not whichever model happens to be alive. The inverse holds
+   too: if the only live model is remote and the role is fenced local, you
+   get a clear 502, not a silent upload.
+3. **The registry's `api_key` wins over the client's bearer.** Your local
+   harness token is never forwarded to a hosted provider; the declared key
+   is used, and client auth passes through only to keyless backends.
+
+Cloud costs stay out of scope (see non-goals), but the cost-shaped defaults
+hold: probes are off for remote models unless opted in per model (each probe
+is a paid request), and a hosted catalog serving hundreds of models is not
+reported as registry drift — only a registered model going missing is.
+
+Offline resilience falls out of FR-9: a cascade like `[cloud-big, local-mid]`
+degrades to the local model the moment the uplink dies, and the decision log
+records the failover.
 
 ## Conventions, not dependencies
 

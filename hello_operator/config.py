@@ -10,6 +10,7 @@ detection disagrees; disagreement is a logged warning, never a silent fix
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -19,6 +20,8 @@ import yaml
 KNOWN_CAPABILITIES = {"text", "vision", "audio", "tools", "json", "reasoning-effort", "embeddings"}
 SPEED_CLASSES = {"fast", "mid", "slow"}
 RESIDENCY = {"resident", "on-demand"}
+LOCATIONS = {"local", "remote"}
+ROLE_LOCALITIES = {"any", "local", "remote"}
 
 # Role names whose conventional meaning implies a capability. Used only for
 # warnings and for capability-filtering of eligible roles; a user can make the
@@ -34,6 +37,24 @@ class ConfigError(Exception):
     """Raised for configuration the router refuses to start on (FR-10)."""
 
 
+def infer_location(endpoint: str) -> str:
+    """local | remote, from the endpoint host. Loopback, RFC-1918, and
+    machine-local hostnames are local; everything else leaves the box."""
+    m = re.match(r"^[a-z+]+://([^/:@]+@)?(\[[^\]]+\]|[^/:]+)", endpoint.strip())
+    host = (m.group(2) if m else "").strip("[]").lower()
+    if host in ("localhost", "127.0.0.1", "::1", "0.0.0.0", "host.docker.internal"):
+        return "local"
+    if re.match(r"^127\.", host) or re.match(r"^10\.", host) \
+            or re.match(r"^192\.168\.", host) \
+            or re.match(r"^172\.(1[6-9]|2\d|3[01])\.", host) \
+            or re.match(r"^169\.254\.", host) \
+            or host.endswith((".local", ".lan", ".internal", ".home.arpa")):
+        return "local"
+    if re.match(r"^fe80:|^fd[0-9a-f]{2}:|^fc[0-9a-f]{2}:", host):
+        return "local"
+    return "remote"
+
+
 @dataclass
 class ModelSpec:
     key: str                      # registry key (what cascades reference)
@@ -44,14 +65,18 @@ class ModelSpec:
     residency: str = "resident"
     speed_class: str = "mid"
     api_key: str = ""             # optional bearer token some backends want
-    probe: Optional[bool] = None  # None => default: probes off for on-demand (3.1a)
+    location: str = "local"       # local | remote; declared > inferred from endpoint
+    probe: Optional[bool] = None  # None => default: probes off for on-demand
+                                  # AND for remote models (each probe costs money)
     provenance: dict[str, str] = field(default_factory=dict)
 
     @property
     def probes_enabled(self) -> bool:
         if self.probe is not None:
             return self.probe
-        return self.residency != "on-demand"
+        # Off by default for on-demand (a probe forces a load) and for remote
+        # models (a probe spends real money on a hosted endpoint).
+        return self.residency != "on-demand" and self.location != "remote"
 
 
 @dataclass
@@ -61,6 +86,8 @@ class RoleSpec:
     utterances: Optional[list[str]] = None   # None => shipped defaults (classify.py)
     requires: set[str] = field(default_factory=set)  # hard capability requirements
     buffered: bool = False                   # FR-8 optional buffered mode, per-role
+    locality: str = "any"                    # any | local | remote — a hard fence:
+                                             # neither routing nor failover crosses it
 
 
 @dataclass
@@ -68,6 +95,7 @@ class Settings:
     listen_host: str = "127.0.0.1"
     listen_port: int = 8800
     allow_non_loopback: bool = False
+    allow_remote_endpoints: bool = False  # models whose traffic leaves the box
     logical_model: str = "hello-operator"
     session_header: str = "x-session-id"
     compaction_header: str = "x-context-compacted"
@@ -176,11 +204,17 @@ def _parse_model(key: str, raw: dict, detected: dict, warnings: list) -> ModelSp
     if not isinstance(ctx, int) or ctx <= 0:
         raise ConfigError(f"model '{key}': context_window must be a positive integer")
 
+    location = _resolve_field("location", raw.get("location"),
+                              infer_location(str(endpoint)), "local",
+                              prov, warnings, key)
+    if location not in LOCATIONS:
+        raise ConfigError(f"model '{key}': location must be one of {sorted(LOCATIONS)}")
+
     api_key = os.path.expandvars(str(raw.get("api_key", "") or ""))
     return ModelSpec(key=key, id=str(mid), endpoint=str(endpoint).rstrip("/"),
                      capabilities=set(caps), context_window=int(ctx),
                      residency=residency, speed_class=speed, api_key=api_key,
-                     probe=raw.get("probe"), provenance=prov)
+                     location=location, probe=raw.get("probe"), provenance=prov)
 
 
 def _parse_settings(raw_router: dict, raw_routing: dict) -> Settings:
@@ -207,7 +241,7 @@ def _parse_settings(raw_router: dict, raw_routing: dict) -> Settings:
                  "media_token_estimate", "context_safety_margin", "repeat_call_threshold"):
         if name in raw_router:
             setattr(s, name, int(raw_router[name]))
-    for name in ("allow_non_loopback", "refusal_escalate"):
+    for name in ("allow_non_loopback", "allow_remote_endpoints", "refusal_escalate"):
         if name in raw_router:
             setattr(s, name, bool(raw_router[name]))
     if "refusal_markers" in raw_router:
@@ -268,6 +302,7 @@ def load(path: str, detected_cache: Optional[dict[str, dict]] = None) -> Config:
             utterances=[str(u) for u in r["utterances"]] if r.get("utterances") else None,
             requires=set(r.get("requires") or []),
             buffered=bool(r.get("buffered", False)),
+            locality=str(r.get("locality", "any")),
         )
 
     # Degenerate installs are first-class (spec 2.3): with exactly one model and
@@ -304,6 +339,38 @@ def load(path: str, detected_cache: Optional[dict[str, dict]] = None) -> Config:
             warnings.append(f"role '{role.name}': name implies {sorted(implied)} but "
                             f"position-0 model '{p0.key}' does not declare them")
 
+    # Remote models are an explicit opt-in (the original NFR-2 was "no
+    # outbound network calls"; mixing hosted endpoints relaxes that to "no
+    # outbound calls beyond endpoints you declared AND enabled").
+    remote_models = sorted(m.key for m in models.values() if m.location == "remote")
+    if embedding is not None and embedding.location == "remote":
+        remote_models.append("embedding")
+    if remote_models and not settings.allow_remote_endpoints:
+        raise ConfigError(
+            f"model(s) {remote_models} resolve to remote endpoints — their "
+            "traffic leaves this machine. Set router.allow_remote_endpoints: "
+            "true to opt in explicitly, or declare 'location: local' on a "
+            "model this inference is wrong about (e.g. a tailnet host)")
+    if remote_models:
+        warnings.append(f"remote endpoints enabled: traffic for {remote_models} "
+                        "leaves this machine")
+
+    # Role locality is a hard fence: every cascade entry must satisfy it, so
+    # a 'local' role can never contain (and FR-9 failover can never reach) a
+    # remote model. Validated here, enforced again in failover candidate
+    # selection.
+    for role in roles.values():
+        if role.locality not in ROLE_LOCALITIES:
+            raise ConfigError(f"role '{role.name}': locality must be one of "
+                              f"{sorted(ROLE_LOCALITIES)}")
+        if role.locality != "any":
+            bad = [mk for mk in role.cascade
+                   if models[mk].location != role.locality]
+            if bad:
+                raise ConfigError(
+                    f"role '{role.name}' declares locality '{role.locality}' "
+                    f"but cascade model(s) {bad} are not {role.locality}")
+
     # FR-12: loopback by default; anything else is explicit opt-in.
     if settings.listen_host not in ("127.0.0.1", "localhost", "::1") and not settings.allow_non_loopback:
         raise ConfigError(
@@ -329,7 +396,8 @@ def provenance_table(cfg: Config) -> str:
     lines = []
     for m in list(cfg.models.values()) + ([cfg.embedding] if cfg.embedding else []):
         lines.append(f"model {m.key} ({m.endpoint})")
-        for f_ in ("id", "capabilities", "context_window", "residency", "speed_class"):
+        for f_ in ("id", "capabilities", "context_window", "residency",
+                   "speed_class", "location"):
             val = getattr(m, f_)
             if isinstance(val, set):
                 val = sorted(val)

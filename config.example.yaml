@@ -49,6 +49,17 @@ models:
     # probe: true                 # probes default off for on-demand models (3.1a)
     # api_key: ${SOME_TOKEN}      # for backends that want a bearer token
 
+  # A hosted model is just another registry entry. Its traffic leaves the
+  # machine, so the router refuses to start until you also set
+  # router.allow_remote_endpoints: true (location is inferred from the
+  # endpoint host; declare it to override, e.g. for a tailnet box).
+  # cloud-burst:
+  #   id: anthropic/claude-sonnet-4.5
+  #   endpoint: https://openrouter.ai/api/v1
+  #   api_key: ${OPENROUTER_KEY}      # the declared key always wins over the
+  #   capabilities: [text, vision, tools, json]      # client's own bearer
+  #   context_window: 200000
+
 # The embedding model powering role classification is infrastructure, not a
 # routing target (FR-4). Delete this block and classification degrades to
 # default_role + capability filtering — the router will say so at startup.
@@ -70,6 +81,8 @@ roles:
   vision:
     cascade: [main-model]         # a multimodal main needs no separate vision model
     requires: [vision]            # hard capability requirement, validated at startup
+    # locality: local             # fence: this role's sessions never reach a
+    #                             # remote model, not even via failover
     # buffered: true              # hold tool-call responses for validation (FR-8)
 
 routing:

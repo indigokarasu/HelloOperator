@@ -253,8 +253,17 @@ class Router:
                 out.append((spec, role, pos))
 
         assert decision.spec is not None
-        add(decision.spec, decision.role, decision.pos)
         role = self.cfg.roles.get(decision.role)
+        # The locality fence follows the SESSION's role: content routed under
+        # a 'local' role must never fail over to a remote model, even via
+        # another role's cascade (privacy is a property of the conversation,
+        # not of whichever model happens to be alive).
+        fence = role.locality if role else "any"
+
+        def fenced(spec: ModelSpec) -> bool:
+            return fence != "any" and spec.location != fence
+
+        add(decision.spec, decision.role, decision.pos)
         reasons: list[str] = []
         if role:
             for p in self._role_capable_positions(role, props, reasons):
@@ -264,7 +273,10 @@ class Router:
             if rname == decision.role:
                 continue
             for p in positions:
-                add(self.cfg.models[self.cfg.roles[rname].cascade[p]], rname, p)
+                cand = self.cfg.models[self.cfg.roles[rname].cascade[p]]
+                if fenced(cand):
+                    continue
+                add(cand, rname, p)
         # Last resort: earlier positions of the chosen role. An escalated
         # session whose stronger model is down is still better served by the
         # weaker live model than by a 502 (FR-9).
@@ -276,12 +288,17 @@ class Router:
         return out
 
     def _backend_headers(self, request: web.Request, spec: ModelSpec) -> dict:
+        # The registry's api_key wins: it states what THIS backend needs.
+        # Forwarding the client's own bearer instead would leak a local
+        # harness token to a hosted provider (and fail auth there). The
+        # client header is only a fallback for backends with no declared key.
         headers = {}
-        auth = request.headers.get("Authorization")
-        if auth:
-            headers["Authorization"] = auth
-        elif spec.api_key:
+        if spec.api_key:
             headers["Authorization"] = f"Bearer {spec.api_key}"
+        else:
+            auth = request.headers.get("Authorization")
+            if auth:
+                headers["Authorization"] = auth
         return headers
 
     def _forward_body(self, body: dict, spec: ModelSpec) -> dict:

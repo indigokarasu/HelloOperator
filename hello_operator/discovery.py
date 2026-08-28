@@ -162,10 +162,18 @@ async def harvest(http: aiohttp.ClientSession, endpoint: str, model_id: str) -> 
             for m in models:
                 if m.get("id") == model_id:
                     detected.setdefault("source", "openai-generic")
-                    mml = m.get("max_model_len")
+                    mml = m.get("max_model_len")           # vLLM extension
                     if isinstance(mml, int):
                         detected["context_window"] = mml
                         detected["source"] = "vllm"
+                    cl = m.get("context_length")           # OpenRouter extension
+                    if isinstance(cl, int) and "context_window" not in detected:
+                        detected["context_window"] = cl
+                        detected["source"] = "openrouter-style"
+                    arch = m.get("architecture") or {}
+                    mods = arch.get("input_modalities") or []
+                    if "image" in mods:
+                        detected.setdefault("capabilities", [])
                     break
 
     if caps:
@@ -354,10 +362,11 @@ async def detect_all(http: aiohttp.ClientSession, cfg: Config,
         # probe forces a full load, precisely the cost that configuration
         # avoids. Declared on-demand OR detected not-loaded both count, unless
         # the user set probe: true explicitly on the model (3.1a).
-        on_demand = (spec.residency == "on-demand"
-                     or detected.get("residency") == "on-demand")
+        costly = (spec.residency == "on-demand"
+                  or detected.get("residency") == "on-demand"
+                  or spec.location == "remote")
         want_probe = probe and (spec.probe is True
-                                or (spec.probes_enabled and not on_demand))
+                                or (spec.probes_enabled and not costly))
         if want_probe:
             # Serial by construction: one model at a time in this loop.
             probes = await run_probes(http, spec)
@@ -383,8 +392,14 @@ async def drift_check(http: aiohttp.ClientSession, cfg: Config) -> list[str]:
     """Flag registry drift; never silently add or drop routing targets."""
     notes = []
     by_endpoint: dict[str, set[str]] = {}
+    remote_endpoint: dict[str, bool] = {}
     for m in cfg.models.values():
         by_endpoint.setdefault(m.endpoint, set()).add(m.id)
+        # Declaration wins here too (3.1): an endpoint counts as remote when
+        # any of its registered models RESOLVES remote, not just when its
+        # address looks remote.
+        remote_endpoint[m.endpoint] = (remote_endpoint.get(m.endpoint, False)
+                                       or m.location == "remote")
     for endpoint, ids in by_endpoint.items():
         served = await list_backend_models(http, endpoint)
         if served is None:
@@ -392,7 +407,9 @@ async def drift_check(http: aiohttp.ClientSession, cfg: Config) -> list[str]:
         served_ids = {m.get("id", "") for m in served}
         extra = served_ids - ids
         missing = ids - served_ids
-        if extra:
+        # A hosted provider's full catalog is not registry drift; for remote
+        # endpoints only a registered model going missing is worth a flag.
+        if extra and not remote_endpoint.get(endpoint, False):
             notes.append(f"drift: {endpoint} serves models not in the registry: "
                          f"{sorted(extra)}")
         if missing:
