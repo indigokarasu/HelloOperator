@@ -1,0 +1,76 @@
+# hermes-model-router — example configuration
+#
+# This file is the whole configuration surface (FR-14): one file, no database.
+# Every model field resolves declared > detected > default, and the router
+# shows the provenance of each value at startup and in `--check`.
+#
+# The degenerate configuration is first-class: with exactly one model you can
+# delete `roles:` and `routing:` entirely and the router behaves like a direct
+# connection (NFR-7). Routing is something a config grows into.
+
+router:
+  listen: 127.0.0.1:8800          # loopback by default (FR-12); binding anything
+  # allow_non_loopback: true      # else requires this explicit opt-in
+  logical_model: hermes-router    # the one model name clients target (FR-1)
+  session_header: x-session-id    # caller-supplied session identity (FR-5)
+  compaction_header: x-context-compacted   # documented convention, not a hard dependency
+  pin_header: x-router-pin        # manual override for debugging (FR-13)
+  affinity_idle_timeout_s: 3600
+  switch_cost: low                # low | high — high raises transition thresholds (FR-6)
+  hop_limit: 1                    # max escalation hops per session (FR-7)
+  classify_margin: 0.08           # classifier disagreement needed to switch roles
+  max_inflight: 0                 # >0 caps concurrent backend requests (NFR-5)
+  repeat_call_threshold: 3        # identical call repeated this often => escalate
+  decision_log: ""                # path to a JSONL decision log; empty disables (FR-11)
+  state_dir: ~/.hermes-model-router
+  # refusal_markers: []           # advisory string match, off by default (FR-7 MAY)
+  # refusal_escalate: false
+
+# ------------------------------------------------------------------ registry
+# Each model the user runs is declared once (spec 3.1). `capabilities`,
+# `context_window`, `residency`, and `speed_class` may be omitted — detection
+# fills what the backend exposes, heuristic defaults fill the rest, and your
+# declarations always win.
+models:
+  main-model:
+    id: qwen3-235b-a22b
+    endpoint: http://127.0.0.1:8080/v1        # llama.cpp / Ollama / LM Studio / vLLM / MLX
+    capabilities: [text, vision, tools, json, reasoning-effort]
+    context_window: 131072
+    residency: resident
+    speed_class: slow
+  qwen-fast:
+    id: qwen3-30b-a3b
+    endpoint: http://127.0.0.1:8081/v1
+    capabilities: [text, tools, json]
+    context_window: 32768
+    residency: resident
+    speed_class: fast
+    # probe: true                 # probes default off for on-demand models (3.1a)
+    # api_key: ${SOME_TOKEN}      # for backends that want a bearer token
+
+# The embedding model powering role classification is infrastructure, not a
+# routing target (FR-4). Delete this block and classification degrades to
+# default_role + capability filtering — the router will say so at startup.
+embedding:
+  id: nomic-embed-text
+  endpoint: http://127.0.0.1:8082/v1
+
+# --------------------------------------------------------------------- roles
+# A role names a class of work; its cascade is the ordered list of models
+# serving it. Position 0 is the role's main model; positions 1..n are the
+# escalation path (FR-7). Any role may have a cascade of length one.
+roles:
+  chat:
+    cascade: [qwen-fast, main-model]
+  code:
+    cascade: [main-model]
+    # utterances:                 # override the shipped classification examples
+    #   - "write a function that ..."
+  vision:
+    cascade: [main-model]         # a multimodal main needs no separate vision model
+    requires: [vision]            # hard capability requirement, validated at startup
+    # buffered: true              # hold tool-call responses for validation (FR-8)
+
+routing:
+  default_role: chat

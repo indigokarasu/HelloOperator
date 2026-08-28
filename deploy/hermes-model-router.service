@@ -1,0 +1,19 @@
+# systemd unit (Linux). Install:
+#   cp deploy/hermes-model-router.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now hermes-model-router
+[Unit]
+Description=hermes-model-router (local model routing layer)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hermes-model-router -c /etc/hermes-model-router/config.yaml
+Restart=always
+RestartSec=3
+# The router binds loopback by default (FR-12) and needs no privileges.
+DynamicUser=yes
+StateDirectory=hermes-model-router
+Environment=HOME=%S/hermes-model-router
+
+[Install]
+WantedBy=multi-user.target
