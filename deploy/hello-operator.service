@@ -1,0 +1,19 @@
+# systemd unit (Linux). Install:
+#   cp deploy/hello-operator.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now hello-operator
+[Unit]
+Description=hello-operator (local model routing layer)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hello-operator -c /etc/hello-operator/config.yaml
+Restart=always
+RestartSec=3
+# The router binds loopback by default (FR-12) and needs no privileges.
+DynamicUser=yes
+StateDirectory=hello-operator
+Environment=HOME=%S/hello-operator
+
+[Install]
+WantedBy=multi-user.target

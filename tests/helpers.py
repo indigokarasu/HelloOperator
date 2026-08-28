@@ -17,8 +17,8 @@ import aiohttp
 import yaml
 from aiohttp import web
 
-from router import config as config_mod
-from router.server import build_app
+from hello_operator import config as config_mod
+from hello_operator.server import build_app
 
 MARKERS = ["code", "function", "bug", "fix", "chat", "hello", "weather", "story", "image"]
 
@@ -210,7 +210,7 @@ class RouterEnv:
 
     async def chat(self, messages, session: str = "", stream: bool = False,
                    tools=None, tool_choice=None, headers: dict | None = None,
-                   model: str = "hermes-router", **extra):
+                   model: str = "hello-operator", **extra):
         body: dict = {"model": model, "messages": messages, "stream": stream}
         if tools is not None:
             body["tools"] = tools

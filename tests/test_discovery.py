@@ -7,8 +7,8 @@ import aiohttp
 sys.path.insert(0, str(Path(__file__).parent))
 
 from helpers import FakeBackend, base_config, run
-from router import config as config_mod
-from router import discovery
+from hello_operator import config as config_mod
+from hello_operator import discovery
 
 
 def _cfg(tmp_path, backend_base, native_models):

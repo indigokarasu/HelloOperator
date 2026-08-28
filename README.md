@@ -1,4 +1,7 @@
-# hermes-model-router
+# HelloOperator
+
+*"Hello, operator?" — you dial one number; the switchboard connects you to
+the right line, holds the call, and never joins the conversation.*
 
 A local-first routing layer that automatically selects which of **your**
 models handles a given conversation turn — no per-prompt, per-task, or
@@ -17,7 +20,7 @@ single-model config behaves like a direct connection.
 
 ```bash
 pip install .
-hermes-model-router -c config.yaml
+hello-operator -c config.yaml
 ```
 
 Dependencies: `aiohttp`, `PyYAML`. No database daemon; all persistent state is
@@ -27,12 +30,12 @@ backend (llama.cpp, Ollama, LM Studio, vLLM, MLX server, ...).
 ## Quick start
 
 1. Copy `config.example.yaml` to `config.yaml` and declare your models.
-2. `hermes-model-router --check` — validates config, endpoint reachability,
+2. `hello-operator --check` — validates config, endpoint reachability,
    and shows every resolved field with its provenance
    (`declared` / `detected` / `default`). Fails loudly at startup, never
    silently at request time.
-3. `hermes-model-router` — serve. Point your client at
-   `http://127.0.0.1:8800/v1` with model `hermes-router`.
+3. `hello-operator` — serve. Point your client at
+   `http://127.0.0.1:8800/v1` with model `hello-operator`.
 
 Minimal (degenerate) config — one model, no roles, near-zero overhead:
 
@@ -48,8 +51,8 @@ Routing is something a config grows into, not a tax every install pays.
 ## Discovery
 
 ```bash
-hermes-model-router --discover           # metadata only
-hermes-model-router --discover --probe   # + opt-in active probes, run serially
+hello-operator --discover           # metadata only
+hello-operator --discover --probe   # + opt-in active probes, run serially
 ```
 
 Emits a proposed registry-and-roles config from backend metadata (llama.cpp

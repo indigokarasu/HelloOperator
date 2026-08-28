@@ -1,21 +1,21 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- launchd job (macOS). Install:
-       cp deploy/com.hermes.model-router.plist ~/Library/LaunchAgents/
-       launchctl load -w ~/Library/LaunchAgents/com.hermes.model-router.plist
+       cp deploy/com.indigo.hello-operator.plist ~/Library/LaunchAgents/
+       launchctl load -w ~/Library/LaunchAgents/com.indigo.hello-operator.plist
      Adjust the program path and config location for your install. -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>com.hermes.model-router</string>
+  <key>Label</key><string>com.indigo.hello-operator</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/local/bin/hermes-model-router</string>
+    <string>/usr/local/bin/hello-operator</string>
     <string>-c</string>
-    <string>/usr/local/etc/hermes-model-router/config.yaml</string>
+    <string>/usr/local/etc/hello-operator/config.yaml</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>StandardErrorPath</key><string>/tmp/hermes-model-router.log</string>
+  <key>StandardErrorPath</key><string>/tmp/hello-operator.log</string>
 </dict>
 </plist>

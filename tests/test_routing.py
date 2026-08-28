@@ -336,7 +336,7 @@ def test_models_and_health_endpoints(tmp_path):
             async with env.client.get(f"{env.base}/v1/models") as r:
                 data = await r.json()
             ids = [m["id"] for m in data["data"]]
-            assert "hermes-router" in ids and "fast" in ids and "big" in ids
+            assert "hello-operator" in ids and "fast" in ids and "big" in ids
             async with env.client.get(f"{env.base}/healthz") as r:
                 h = await r.json()
             assert h["status"] == "ok" and h["classification"] == "active"

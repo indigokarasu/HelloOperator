@@ -312,8 +312,8 @@ class Router:
 
     async def handle_models(self, request: web.Request) -> web.Response:
         data = [{"id": self.cfg.settings.logical_model, "object": "model",
-                 "owned_by": "hermes-model-router"}]
-        data += [{"id": k, "object": "model", "owned_by": "hermes-model-router-pin"}
+                 "owned_by": "hello-operator"}]
+        data += [{"id": k, "object": "model", "owned_by": "hello-operator-pin"}
                  for k in self.cfg.models]
         return web.json_response({"object": "list", "data": data})
 

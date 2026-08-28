@@ -411,7 +411,7 @@ async def generate_proposal(http: aiohttp.ClientSession, cfg: Config,
     not that it should front the vision cascade."""
     detected = await detect_all(http, cfg, probe=probe)
     lines = [
-        "# Proposed by `hermes-model-router --discover` on "
+        "# Proposed by `hello-operator --discover` on "
         + time.strftime("%Y-%m-%d %H:%M:%S"),
         "# Review and edit. Nothing routes on this file until you adopt it as",
         "# your config. Every value is marked with its provenance; your own",

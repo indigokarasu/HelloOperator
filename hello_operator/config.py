@@ -68,7 +68,7 @@ class Settings:
     listen_host: str = "127.0.0.1"
     listen_port: int = 8800
     allow_non_loopback: bool = False
-    logical_model: str = "hermes-router"
+    logical_model: str = "hello-operator"
     session_header: str = "x-session-id"
     compaction_header: str = "x-context-compacted"
     pin_header: str = "x-router-pin"
@@ -89,7 +89,7 @@ class Settings:
     refusal_markers: list[str] = field(default_factory=list)  # MAY; empty = off
     refusal_escalate: bool = False        # advisory only unless explicitly enabled
     decision_log: str = ""                # path; empty disables (FR-11)
-    state_dir: str = "~/.hermes-model-router"
+    state_dir: str = "~/.hello-operator"
     default_role: str = ""
 
 

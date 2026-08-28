@@ -104,7 +104,7 @@ async def _pre_serve(cfg: Config) -> Config:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
-        prog="hermes-model-router",
+        prog="hello-operator",
         description="Local-first routing layer for OpenAI-compatible models")
     ap.add_argument("-c", "--config", default="config.yaml",
                     help="path to the single config file (default: ./config.yaml)")
@@ -141,7 +141,7 @@ def main(argv: list[str] | None = None) -> int:
     app = build_app(cfg)
     mode = "degenerate (single model, selection bypassed)" if cfg.degenerate \
         else f"{len(cfg.models)} models, {len(cfg.roles)} roles"
-    log.info("hermes-model-router serving %s on %s:%d — logical model '%s' (%s)",
+    log.info("HelloOperator serving %s on %s:%d — logical model '%s' (%s)",
              mode, cfg.settings.listen_host, cfg.settings.listen_port,
              cfg.settings.logical_model,
              "loopback" if not cfg.settings.allow_non_loopback else "NON-LOOPBACK opt-in")

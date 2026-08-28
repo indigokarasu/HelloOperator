@@ -9,11 +9,11 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from router import config as config_mod
-from router.affinity import derive_session_key
-from router.capabilities import extract_props, model_ok
-from router.config import ConfigError, Settings
-from router.escalate import (StreamCollector, calls_signature,
+from hello_operator import config as config_mod
+from hello_operator.affinity import derive_session_key
+from hello_operator.capabilities import extract_props, model_ok
+from hello_operator.config import ConfigError, Settings
+from hello_operator.escalate import (StreamCollector, calls_signature,
                              missing_required_call, validate_tool_calls)
 
 
@@ -135,7 +135,7 @@ def test_tools_signature_stable_and_order_independent():
 
 
 def test_context_window_filter():
-    from router.config import ModelSpec
+    from hello_operator.config import ModelSpec
     spec = ModelSpec(key="s", id="s", endpoint="e", capabilities={"text"},
                      context_window=1024)
     big = {"messages": [{"role": "user", "content": "x" * 40000}]}
@@ -144,7 +144,7 @@ def test_context_window_filter():
 
 
 def test_vision_filter_names_constraint():
-    from router.config import ModelSpec
+    from hello_operator.config import ModelSpec
     spec = ModelSpec(key="s", id="s", endpoint="e", capabilities={"text"},
                      context_window=8192)
     body = {"messages": [{"role": "user", "content": [

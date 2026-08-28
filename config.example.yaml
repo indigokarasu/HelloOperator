@@ -1,4 +1,4 @@
-# hermes-model-router — example configuration
+# HelloOperator — example configuration
 #
 # This file is the whole configuration surface (FR-14): one file, no database.
 # Every model field resolves declared > detected > default, and the router
@@ -11,7 +11,7 @@
 router:
   listen: 127.0.0.1:8800          # loopback by default (FR-12); binding anything
   # allow_non_loopback: true      # else requires this explicit opt-in
-  logical_model: hermes-router    # the one model name clients target (FR-1)
+  logical_model: hello-operator    # the one model name clients target (FR-1)
   session_header: x-session-id    # caller-supplied session identity (FR-5)
   compaction_header: x-context-compacted   # documented convention, not a hard dependency
   pin_header: x-router-pin        # manual override for debugging (FR-13)
@@ -22,7 +22,7 @@ router:
   max_inflight: 0                 # >0 caps concurrent backend requests (NFR-5)
   repeat_call_threshold: 3        # identical call repeated this often => escalate
   decision_log: ""                # path to a JSONL decision log; empty disables (FR-11)
-  state_dir: ~/.hermes-model-router
+  state_dir: ~/.hello-operator
   # refusal_markers: []           # advisory string match, off by default (FR-7 MAY)
   # refusal_escalate: false
 

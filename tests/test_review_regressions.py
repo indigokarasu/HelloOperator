@@ -14,11 +14,11 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from helpers import (WEATHER_TOOL, FakeBackend, RouterEnv, bad_json_call,
                      base_config, good_call, run)
-from router import config as config_mod
-from router import discovery
-from router.capabilities import extract_props
-from router.config import Settings
-from router.escalate import StreamCollector
+from hello_operator import config as config_mod
+from hello_operator import discovery
+from hello_operator.capabilities import extract_props
+from hello_operator.config import Settings
+from hello_operator.escalate import StreamCollector
 
 
 def _echo(name):
@@ -196,7 +196,7 @@ def test_detection_reaches_the_served_config(tmp_path):
             cfg_path.write_text(yaml.safe_dump(doc))
             cfg = config_mod.load(str(cfg_path))
             # this is exactly what serve mode now does
-            from router.__main__ import _pre_serve
+            from hello_operator.__main__ import _pre_serve
             cfg2 = await _pre_serve(cfg)
         finally:
             await backend.stop()
