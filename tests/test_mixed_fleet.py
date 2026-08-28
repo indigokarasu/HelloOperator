@@ -249,3 +249,32 @@ def test_remote_probes_default_off(tmp_path):
     opted = ModelSpec(key="c", id="c", endpoint="https://api.x.com/v1",
                       location="remote", probe=True)
     assert opted.probes_enabled is True
+
+
+def test_rate_capped_backend_fails_over(tmp_path):
+    # a hosted free tier answering 429 (daily cap) must not kill the turn —
+    # the next provider in the cascade serves (FR-9)
+    async def scenario():
+        from aiohttp import web
+
+        def capped(body, idx):
+            return web.json_response(
+                {"error": {"message": "rate limit exceeded", "code": 429}},
+                status=429)
+        backend = FakeBackend({"capped-model": capped, "loc-model": _echo("local")})
+        cfg = mixed_cfg(tmp_path)
+        cfg["models"]["cld"]["id"] = "capped-model"
+        cfg["models"]["loc"]["id"] = "loc-model"
+        cfg["routing"]["default_role"] = "burst"
+        async with RouterEnv(tmp_path, cfg, backend) as env:
+            status, payload, headers = await env.chat(
+                [{"role": "user", "content": "hi"}], session="s1")
+            assert status == 200
+            assert payload["choices"][0]["message"]["content"] == "answer from local"
+            assert headers["x-router-decision"] == "failover"
+            # streaming path too
+            status, payload, headers = await env.chat(
+                [{"role": "user", "content": "hi"}], session="s2", stream=True)
+            assert status == 200
+            assert payload["choices"][0]["message"]["content"] == "answer from local"
+    run(scenario())

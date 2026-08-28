@@ -478,7 +478,11 @@ class Router:
                             "the previous answer and arming the next turn (FR-9)")
                 break
             async with client_resp:
-                if client_resp.status >= 500:
+                if client_resp.status >= 500 or client_resp.status in (402, 429):
+                    # 5xx: backend broken. 402/429: quota or rate cap — on a
+                    # free-tier fleet a daily cap answers 429 all day, and the
+                    # whole point of the cascade is that the next provider
+                    # might still serve (FR-9).
                     if prev is not None:
                         spec, decision, payload, message, failures = prev
                         break
@@ -543,7 +547,7 @@ class Router:
         spec = decision.spec
         assert spec is not None
         client_resp = await self._post_backend(request, spec, body, stream=True)
-        if client_resp.status >= 500:
+        if client_resp.status >= 500 or client_resp.status in (402, 429):
             client_resp.close()
             raise _RetryableStatus(client_resp.status)
         collector = StreamCollector()
