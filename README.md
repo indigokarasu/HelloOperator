@@ -1,20 +1,19 @@
 # HelloOperator
 
-*"Hello, operator?" — you dial one number; the switchboard connects you to
-the right line, holds the call, and never joins the conversation.*
+*"Hello, operator? Get me..." You dial one number. The switchboard does the rest.*
 
-A local-first routing layer that automatically selects which of **your**
-models handles a given conversation turn — no per-prompt, per-task, or
-per-session model selection by the operator.
+HelloOperator sits in front of the models you already run and picks which one
+handles each conversation turn. Clients see a single OpenAI-compatible endpoint
+with a single model name. Behind it, requests get matched to a role (chat, code,
+vision, whatever you define), sessions stick with the model they started on, and
+when a model fails in a way the router can actually observe, the next one in
+line takes over.
 
-It presents one OpenAI-compatible endpoint. Hermes profiles (or any
-OpenAI-compatible client) target one logical model name; the router selects
-among the models you have configured, holds sessions to their model, and walks
-an escalation cascade on mechanically observable failure.
+It ships with no opinions about which models are good. You declare what you run
+and it routes among that. Configure exactly one model and it behaves like a
+plain proxy that stays out of the way.
 
-Implements `docs/requirements-v0.4.md`. Design in one line: **the user's
-models, not assumed models** — the router ships with no model opinions, and a
-single-model config behaves like a direct connection.
+The requirements doc it implements is at `docs/requirements-v0.4.md`.
 
 ## Install
 
@@ -23,21 +22,22 @@ pip install .
 hello-operator -c config.yaml
 ```
 
-Dependencies: `aiohttp`, `PyYAML`. No database daemon; all persistent state is
-files under `state_dir`. Runs on macOS and Linux against any OpenAI-compatible
-backend (llama.cpp, Ollama, LM Studio, vLLM, MLX server, ...).
+Two dependencies: `aiohttp` and `PyYAML`. There is no database; persistent
+state is a few files under `state_dir`. Works on macOS and Linux against
+anything that speaks the OpenAI API: llama.cpp, Ollama, LM Studio, vLLM, an
+MLX server, or a hosted provider.
 
 ## Quick start
 
 1. Copy `config.example.yaml` to `config.yaml` and declare your models.
-2. `hello-operator --check` — validates config, endpoint reachability,
-   and shows every resolved field with its provenance
-   (`declared` / `detected` / `default`). Fails loudly at startup, never
-   silently at request time.
-3. `hello-operator` — serve. Point your client at
-   `http://127.0.0.1:8800/v1` with model `hello-operator`.
+2. Run `hello-operator --check`. It validates the config, confirms your
+   endpoints answer, and prints every resolved field along with where the
+   value came from (declared, detected, or default). Bad config fails here at
+   startup instead of surprising you at request time.
+3. Run `hello-operator` and point your client at `http://127.0.0.1:8800/v1`
+   with model `hello-operator`.
 
-Minimal (degenerate) config — one model, no roles, near-zero overhead:
+The smallest useful config is one model and nothing else:
 
 ```yaml
 models:
@@ -46,172 +46,199 @@ models:
     endpoint: http://127.0.0.1:8080/v1
 ```
 
-Routing is something a config grows into, not a tax every install pays.
+Roles and cascades are there when you want them. Start with the proxy, add
+routing once a single model stops being enough.
 
 ## Discovery
 
 ```bash
 hello-operator --discover           # metadata only
-hello-operator --discover --probe   # + opt-in active probes, run serially
+hello-operator --discover --probe   # also run the active probes, one at a time
 ```
 
-Emits a proposed registry-and-roles config from backend metadata (llama.cpp
-`/props`, Ollama `/api/show`, LM Studio `/api/v0/models`, vLLM
-`max_model_len`), optional probes (tools / vision / JSON verified by response
-shape; a timed micro-benchmark for `speed_class`), and name heuristics as
-tie-breaking hints only. **Nothing routes on the proposal until you adopt it**
-— and your declarations always win over detection; disagreement is a logged
-warning, never a silent correction.
+`--discover` asks your backends what they know and writes out a proposed
+config: context windows and capabilities from llama.cpp `/props`, Ollama
+`/api/show`, LM Studio's `/api/v0/models`, or vLLM's `max_model_len`, plus
+optional probes that verify tool calling, vision, and JSON mode by actually
+trying them. A short timed run estimates each model's speed class. Name
+heuristics ("-vl-", "coder", "embed") only break ties; they never assert a
+capability on their own.
 
-Probes default **off** for `residency: on-demand` models: probing one forces a
-full model load, which is precisely the cost that configuration exists to
-avoid.
+Nothing routes on the proposal until you adopt it as your config. And your own
+declarations always beat detection. If a backend disagrees with something you
+declared, you get a warning with both values, and the router proceeds on yours.
 
-At startup the router also flags **registry drift** — models a backend serves
-that you haven't registered, and registered models a backend no longer serves.
-It never silently adds or drops routing targets.
+Probes are off by default for `residency: on-demand` models, because probing
+one forces a full model load, which is usually the exact cost that setting
+exists to avoid. Same for remote models, where every probe is a paid request.
 
-## How a request is routed
+At startup the router also flags registry drift: models a backend serves that
+you never registered, and registered models a backend has stopped serving. It
+tells you and changes nothing.
 
-Selection order: **capability filter → role classification → cascade position.**
+## How a request gets routed
 
-1. **Capability filter** (hard, zero inference cost): image/audio anywhere in
-   the message history requires a model declaring `vision`/`audio`; tool
-   definitions require `tools`; the estimated token count must fit the model's
-   context window. If nothing survives, you get a clear error naming the
-   constraint — media is never silently routed to a text-only model.
-2. **Role classification**: the current message is scored by embedding
-   similarity against per-role example utterances (shipped defaults for
-   `chat` / `code` / `vision` / `unfiltered`, overridable per role). The
-   embedding model is a registry entry you provide; without one,
-   classification degrades to `default_role` + capability filtering and the
-   router says so. LLM-based routing calls are rejected by design.
-3. **Cascade position**: session affinity and escalation state decide how far
-   down the role's cascade the session sits.
+Three steps, in order: capability filter, role classification, cascade
+position.
+
+1. **Capability filter.** An image or audio part anywhere in the message
+   history requires a model that declares `vision` or `audio`. Tool
+   definitions require `tools`. The estimated token count has to fit the
+   model's context window. This is a hard filter with zero inference cost,
+   and if nothing survives it, you get an error naming the exact constraint.
+   Media never gets quietly routed to a text-only model.
+2. **Role classification.** The current message is scored by embedding
+   similarity against example utterances for each role. Defaults ship for
+   `chat`, `code`, `vision`, and `unfiltered`; override them per role. The
+   embedding model is a registry entry you provide. Without one,
+   classification falls back to `default_role` plus the capability filter,
+   and the router says so at startup. Using an LLM call to route was rejected
+   on principle: on shared local hardware it spends a whole generation making
+   a decision an embedding pass makes in milliseconds.
+3. **Cascade position.** Session affinity and escalation state decide how far
+   down the role's cascade the session currently sits.
 
 ### Affinity and transitions
 
-Once routed, a session follows its model (keyed on `x-session-id`, then
-`session_id`/`user` in the body, then a fragile history hash). A 20-step tool
-chain stays on one model. Reclassification happens only at observable
-transitions:
+Once a session is routed, it follows its model. The session key comes from the
+`x-session-id` header, then `session_id` or `user` in the body, then a history
+hash as a last resort (the hash is fragile under compaction, which is why it's
+last). A twenty-step tool chain stays on one model the whole way through.
+
+Reclassification only happens at points where something observable changed:
 
 | Transition | Why |
 |---|---|
-| Material tool-set change | Phase change (discussion → implementation) |
-| Classifier disagreement beyond `classify_margin` | Intent shifted |
-| Compaction (`x-context-compacted` header, or a large context drop) | The re-prefill is already being paid; switching is free |
-| Escalation trigger | The current model demonstrably failed |
+| The tool set changed materially | Phase change, e.g. discussion to implementation |
+| The classifier disagrees beyond `classify_margin` | Intent shifted |
+| Compaction (`x-context-compacted` header, or a large context drop) | The re-prefill is being paid anyway, so switching is free |
+| An escalation trigger fired | The current model demonstrably failed |
 
-`switch_cost: high` raises the transition thresholds (for load-on-demand
-installs where a switch costs a model load); it does not change the mechanism.
+`switch_cost: high` raises those thresholds for installs where switching
+means loading a model from disk. It only changes how eager the router is to
+move; the decision logic stays the same.
 
 ### Escalation
 
-Cascades walk one position on **mechanically observable failure only** —
-never on model self-assessment:
+Cascades walk one position on mechanically observable failure. The router
+never asks a model whether it's struggling; it checks things it can verify:
 
-- a tool call whose arguments don't parse against the supplied schema
-- no tool call where `tool_choice` structurally required one
-- an identical call with identical arguments repeated past
-  `repeat_call_threshold`
-- (advisory, off by default) refusal string markers
+- a tool call whose arguments fail to parse against the supplied schema
+- no tool call where `tool_choice` required one
+- the same call with the same arguments repeated past `repeat_call_threshold`
+- refusal string markers, if you turn them on (advisory, off by default,
+  because string matching is brittle)
 
-Non-streaming responses are validated **before release** and retried one
-cascade position down within the same request (`hop_limit` caps total hops per
-session). Once a response **streams**, the turn is committed: validation runs
-on the assembled stream and escalation applies to the next turn. A role with
-`buffered: true` holds tool-call-bearing streaming responses for validation
-first, trading latency for retractability.
+Non-streaming responses are validated before release and retried one cascade
+position down within the same request, up to `hop_limit`. Streaming is
+different: once tokens reach the client the turn is committed, so validation
+runs on the assembled stream and any escalation applies to the next turn. If
+you want retractability for a tool-heavy role, set `buffered: true` on it and
+the router will hold streaming responses for validation before releasing them.
+That trades latency for the ability to swap models before the client sees
+anything.
 
-### Degraded operation
+### When things break
 
-The router must never be the component that kills an unattended run:
+The router should never be the reason an unattended run dies. The degraded
+behaviors:
 
 | Condition | Behavior |
 |---|---|
-| Embedding model down | `default_role` + capability filter; request proceeds |
-| Every model filtered out | Clear error naming the constraint |
-| Affinity lost (restart) | Reclassify; one re-prefill per active session |
-| Backend unreachable | Next cascade position, then any eligible model within the role's locality fence; logged |
+| Embedding model down | `default_role` plus capability filter; the request proceeds |
+| Every model filtered out | An error naming the constraint |
+| Affinity lost (restart) | Reclassify; costs one re-prefill per active session |
+| Backend unreachable, 5xx, or rate-capped | Next cascade position, then any eligible model inside the role's locality fence; logged |
 
 ## Observability
 
-- Response headers on every turn: `x-router-model`, `x-router-backend-model`,
-  `x-router-role`, `x-router-pos`, `x-router-decision`, `x-router-latency-ms`.
-  Non-streaming bodies also carry an ignorable `router` object.
-- `decision_log`: one JSONL line per decision (session, role, model, cascade
-  position, trigger, decision type, routing latency). **Escalation rate per
-  role is the primary tuning signal** — a healthy band is roughly 5–30% of
-  sessions; outside it, the cascade order is wrong.
-- `GET /healthz`: mode, classification state, live session count.
+Every response carries headers saying what happened: `x-router-model`,
+`x-router-backend-model`, `x-router-role`, `x-router-pos`,
+`x-router-decision`, and `x-router-latency-ms`. Non-streaming bodies also get
+an ignorable `router` object.
+
+Set `decision_log` and you get one JSONL line per routing decision: session,
+role, model, cascade position, trigger, decision type, latency. The number to
+watch is escalation rate per role. Somewhere between 5% and 30% of sessions is
+healthy. Much outside that band and your cascade order is probably wrong.
+
+`GET /healthz` reports the mode, classification state, and live session count.
 
 ## Manual override
 
-Pin a session for debugging with the `x-router-pin: <model-key>` header (or by
-naming a registered model directly in the `model` field). Pins never bypass
-the capability filter. Frequent pinning is a routing-failure signal — the
-design goal is zero pins in normal operation.
+Pin a session with the `x-router-pin: <model-key>` header, or by naming a
+registered model directly in the `model` field. Pins skip classification but
+never skip the capability filter. If you find yourself pinning often, that's
+the router telling you its config is wrong.
 
 ## Mixing cloud and local models
 
-Any OpenAI-compatible endpoint can be a registry entry — including hosted
-ones (OpenRouter, OpenAI, Anthropic's compatibility endpoint). Three rules
-keep the mix honest:
+Hosted endpoints (OpenRouter, OpenAI, Anthropic's compatibility endpoint) are
+just registry entries. Mixing them with local models raises questions that a
+router shouldn't answer silently, so three rules govern it.
 
-1. **Remote is an explicit opt-in.** Every model resolves a `location`
-   (`local` | `remote`) — declared, else inferred from the endpoint host
-   (loopback, RFC-1918, `.local`/`.lan` → local). If anything resolves
-   remote, the router refuses to start until you set
-   `router.allow_remote_endpoints: true`, and then says at startup exactly
-   which models' traffic leaves the machine. A tailnet host that *looks*
-   remote can be declared `location: local` — declarations win.
-2. **Role locality is a fence failover cannot cross.** A role with
-   `locality: local` accepts only local models in its cascade (validated at
-   startup), and a session routed under it will never fail over to a remote
-   model — not even through another role's cascade. Privacy follows the
-   conversation, not whichever model happens to be alive. The inverse holds
-   too: if the only live model is remote and the role is fenced local, you
-   get a clear 502, not a silent upload.
-3. **The registry's `api_key` wins over the client's bearer.** Your local
-   harness token is never forwarded to a hosted provider; the declared key
-   is used, and client auth passes through only to keyless backends.
+Remote is opt-in. Every model resolves a `location` of `local` or
+`remote`, declared or inferred from the endpoint host. Loopback, RFC-1918
+addresses, and `.local`/`.lan` names count as local. If anything resolves
+remote, the router refuses to start until you set
+`router.allow_remote_endpoints: true`, and once you do, it names exactly which
+models' traffic leaves the machine. A tailnet host that looks remote can be
+declared `location: local`, and the declaration wins.
 
-Cloud costs stay out of scope (see non-goals), but the cost-shaped defaults
-hold: probes are off for remote models unless opted in per model (each probe
-is a paid request), and a hosted catalog serving hundreds of models is not
-reported as registry drift — only a registered model going missing is.
+Role locality is a fence that failover can't cross. A role with
+`locality: local` only accepts local models in its cascade (checked at
+startup), and a session routed under it will never fail over to a remote
+model, even through another role's cascade. The constraint stays with the
+conversation itself, whatever happens to be alive at the moment. So if the
+only live model is remote and the role is fenced local, you get a 502
+explaining why, instead of your conversation quietly leaving the machine.
 
-Offline resilience falls out of FR-9: a cascade like `[cloud-big, local-mid]`
-degrades to the local model the moment the uplink dies, and the decision log
-records the failover.
+And the registry's `api_key` beats the client's bearer token. Your local
+harness token never gets forwarded to a hosted provider. Client auth passes
+through only to backends with no declared key of their own.
+
+Cost tracking stays out of scope, but the defaults are shaped by cost anyway:
+probes stay off for remote models unless you opt in per model, and a hosted
+catalog serving hundreds of models is never reported as drift. Only a
+registered model going missing is.
+
+There's a nice side effect for offline use. A cascade like
+`[cloud-big, local-mid]` degrades to the local model the moment your uplink
+dies, and the decision log records the failover. Quota exhaustion works the
+same way: a 429 or 402 from a hosted free tier walks the cascade instead of
+ending your turn.
 
 ## Conventions, not dependencies
 
-Hermes integration points are documented conventions so the router works with
-any OpenAI-compatible harness unmodified:
+The Hermes integration points are documented conventions, so the router works
+with any OpenAI-compatible harness unmodified:
 
-- session identity: `x-session-id` header (or `session_id` / `user` body field)
-- compaction signal: `x-context-compacted: true` header on the first request
-  after a context compaction (a >40% context drop is also detected
+- session identity: the `x-session-id` header, or `session_id` / `user` in
+  the body
+- compaction signal: an `x-context-compacted: true` header on the first
+  request after a context compaction (a large context drop is also detected
   heuristically)
 
 ## Deploy
 
-Examples for unattended restart under the host's service manager are in
-`deploy/` (systemd unit for Linux, launchd plist for macOS). The router binds
-loopback by default; it fronts models with tool access, so binding other
-interfaces requires the explicit `allow_non_loopback: true`.
+`deploy/` has a systemd unit for Linux and a launchd plist for macOS, for
+unattended restarts under the host's service manager. The router binds
+loopback by default. It fronts models with tool access, so binding any other
+interface requires the explicit `allow_non_loopback: true`.
 
 ## Should this install route at all?
 
-The null hypothesis is route-everything-to-main. Enable roles only when a
-single model demonstrably falls short — latency on mechanical turns, refusals,
-a missing capability. The degenerate config makes "install now, route later"
-safe, and `AC-7` in the requirements is explicit: if routing is less reliable
-than main-only, remove it. All escalation signals are mechanical, so
-well-formed-but-wrong output triggers nothing — which argues for conservative
-cascades (strong model at position 0, fast model as an explicit opt-in).
+Honest answer: maybe not. The null hypothesis is route-everything-to-main, and
+the requirements doc holds routing to a hard bar (AC-7): if routing is less
+reliable than a single model, remove it. Enable roles only when one model
+demonstrably falls short, whether that's latency on mechanical turns,
+refusals, or a missing capability. The single-model config makes "install now,
+route later" safe.
+
+One blind spot worth knowing about: every escalation signal is mechanical, so
+output that is well-formed but wrong triggers nothing. That argues for
+conservative cascades, with your strongest model at position 0 and the fast
+model as a deliberate opt-in.
 
 ## Tests
 
@@ -220,10 +247,12 @@ pip install -e ".[dev]"
 python -m pytest tests/
 ```
 
-58 tests: config resolution/provenance, capability filtering, classification,
+70 tests, all through real loopback sockets against a scriptable fake backend:
+config resolution and provenance, capability filtering, classification,
 affinity, every transition and escalation trigger, streaming commit semantics
-(including a backend dying mid-stream), failover (including HTML-speaking and
-unreachable backends), discovery harvesting (Ollama / llama.cpp / generic),
-drift, and the degenerate path — all through real loopback sockets against a
-scriptable fake backend. `tests/test_review_regressions.py` pins down every
-defect found in the pre-release adversarial review, one test per defect.
+(including a backend dying mid-stream), failover (including backends that
+answer with HTML, go unreachable, or hit rate caps), discovery against Ollama,
+llama.cpp, and generic endpoints, drift, mixed local/cloud fleets with the
+locality fence, and the single-model path. `tests/test_review_regressions.py`
+has one test per defect found in the pre-release adversarial review. If any
+of those bugs comes back, a test fails.
