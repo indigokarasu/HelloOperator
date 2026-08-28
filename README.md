@@ -1,12 +1,8 @@
-# HelloOperator
-
-*"Hello, operator? Get me..." You dial one number. The switchboard does the rest.*
-
 <p align="center">
   <img src="./assets/readme/hero.jpg" width="100%" alt="HelloOperator">
 </p>
 
-HelloOperator sits in front of the models you already run and picks which one
+HelloOperator is a model/provider router for local and remote models. it sits in front of the models you already run and picks which one
 handles each conversation turn. Clients see a single OpenAI-compatible endpoint
 with a single model name. Behind it, requests get matched to a role (chat, code,
 vision, whatever you define), sessions stick with the model they started on, and
