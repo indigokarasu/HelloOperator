@@ -58,7 +58,7 @@ class AffinityMap:
     def ensure(self, key: str) -> SessionState:
         st = self.get(key)
         if st is None:
-            st = SessionState(key=key)
+            st = SessionState(key=key, last_seen=time.monotonic())
             self._sessions[key] = st
         return st
 
@@ -72,7 +72,8 @@ class AffinityMap:
             return
         self._last_sweep = now
         cutoff = now - self.settings.affinity_idle_timeout_s
-        for k in [k for k, s in self._sessions.items() if s.last_seen < cutoff]:
+        expired = [k for k, s in self._sessions.items() if s.last_seen < cutoff]
+        for k in expired:
             del self._sessions[k]
 
     def __len__(self) -> int:
