@@ -238,7 +238,6 @@ def test_session_key_priority():
 
 
 def test_affinity_map_ensure_initializes_last_seen():
-    """New sessions record their creation time and remain retrievable."""
     s = Settings(affinity_idle_timeout_s=3600.0)
     am = AffinityMap(s)
     t_before = time.monotonic()
@@ -251,9 +250,8 @@ def test_affinity_map_ensure_initializes_last_seen():
 
 
 def test_affinity_map_expiry_and_sweep():
-    """Sessions become unavailable after their idle timeout expires."""
     s = Settings(affinity_idle_timeout_s=0.1)
     am = AffinityMap(s)
-    st = am.ensure("hdr:test-2")
+    am.ensure("hdr:test-2")
     time.sleep(0.15)
     assert am.get("hdr:test-2") is None

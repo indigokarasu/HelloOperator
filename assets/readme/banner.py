@@ -4,11 +4,13 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
 import random
 
-random.seed(7); np.random.seed(7)
+random.seed(7)
+np.random.seed(7)
 W, H = 1920, 1080
 
 # ---- field: violet, subtle vertical gradient ----
-base_top = np.array([96, 34, 152]); base_bot = np.array([62, 20, 110])
+base_top = np.array([96, 34, 152])
+base_bot = np.array([62, 20, 110])
 grad = np.linspace(0, 1, H)[:, None, None]
 img = (base_top * (1 - grad) + base_bot * grad).astype(np.uint8)
 img = np.broadcast_to(img, (H, W, 3)).copy()
@@ -36,7 +38,8 @@ def bezier(p0, p1, p2, p3, n=120):
 
 def cable(d, a, b, sag, col, width, split=6):
     (ax, ay), (bx, by) = a, b
-    c1 = (ax + (bx-ax)*0.25, ay + sag); c2 = (ax + (bx-ax)*0.75, by + sag)
+    c1 = (ax + (bx-ax)*0.25, ay + sag)
+    c2 = (ax + (bx-ax)*0.75, by + sag)
     pts = [tuple(p) for p in bezier((ax, ay), c1, c2, (bx, by))]
     # channel-split fringes then body
     d.line([(x-split, y) for x, y in pts], fill=(255, 46, 99, 150), width=width)
@@ -75,7 +78,8 @@ for x0_, x1_ in ((260, 520), (900, 1060), (1420, 1660)):
 
 # ---- global chromatic aberration: split channels in horizontal bands ----
 for _ in range(4):
-    y = random.randint(0, H-60); h = random.randint(14, 60)
+    y = random.randint(0, H-60)
+    h = random.randint(14, 60)
     s = random.choice([-5, -4, 4, 5, 6])
     img[y:y+h, :, 0] = np.roll(img[y:y+h, :, 0], s, axis=1)
     img[y:y+h, :, 2] = np.roll(img[y:y+h, :, 2], -s, axis=1)
@@ -87,15 +91,19 @@ for _ in range(16):
     x, y = random.randint(40, W-220), random.randint(30, H-120)
     w, h = random.randint(40, 190), random.randint(16, 85)
     kind = random.random()
-    if kind < 0.45: col = (196, 120, 220, random.randint(40, 80))     # lighter
-    elif kind < 0.8: col = (30, 8, 40, random.randint(70, 130))       # darker
-    else: col = (124, 92, 255, random.randint(35, 60))                # indigo
+    if kind < 0.45:
+        col = (196, 120, 220, random.randint(40, 80))     # lighter
+    elif kind < 0.8:
+        col = (30, 8, 40, random.randint(70, 130))       # darker
+    else:
+        col = (124, 92, 255, random.randint(35, 60))                # indigo
     d.rectangle([x, y, x+w, y+h], fill=col)
 
 # ---- thin white vertical hairlines ----
 for _ in range(15):
     x = random.randint(80, W-80)
-    y1 = random.randint(40, 500); ln = random.randint(180, 780)
+    y1 = random.randint(40, 500)
+    ln = random.randint(180, 780)
     d.line([(x, y1), (x + random.randint(-3, 3), min(y1+ln, H-40))],
            fill=(255, 255, 255, random.randint(150, 220)), width=1)
 

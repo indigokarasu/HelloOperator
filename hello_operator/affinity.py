@@ -41,13 +41,11 @@ class SessionState:
 
 class AffinityMap:
     def __init__(self, settings: Settings):
-        """Initialize an empty in-memory session map."""
         self.settings = settings
         self._sessions: dict[str, SessionState] = {}
         self._last_sweep = time.monotonic()
 
     def get(self, key: str) -> Optional[SessionState]:
-        """Return a live session for ``key``, removing it if it has expired."""
         self._maybe_sweep()
         st = self._sessions.get(key)
         if st is None:
@@ -58,7 +56,6 @@ class AffinityMap:
         return st
 
     def ensure(self, key: str) -> SessionState:
-        """Return the live session for ``key`` or create one at the current time."""
         st = self.get(key)
         if st is None:
             st = SessionState(key=key, last_seen=time.monotonic())
@@ -66,12 +63,10 @@ class AffinityMap:
         return st
 
     def touch(self, st: SessionState) -> None:
-        """Record activity for a session and increment its completed turn count."""
         st.last_seen = time.monotonic()
         st.turns += 1
 
     def _maybe_sweep(self) -> None:
-        """Periodically remove sessions whose idle timeout has elapsed."""
         now = time.monotonic()
         if now - self._last_sweep < 300:
             return
@@ -82,7 +77,6 @@ class AffinityMap:
             del self._sessions[k]
 
     def __len__(self) -> int:
-        """Return the number of sessions currently stored in memory."""
         return len(self._sessions)
 
 
