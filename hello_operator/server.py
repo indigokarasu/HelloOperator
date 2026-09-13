@@ -422,7 +422,6 @@ class Router:
 
     async def _try_candidates(self, request, body, props, decision, st,
                               candidates, stream, buffered, routing_ms):
-        cfg = self.cfg
         last_error = "no candidates"
         for i, (spec, role, pos) in enumerate(candidates):
             if i > 0:

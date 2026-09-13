@@ -1,7 +1,6 @@
 """Regression tests for the defects found in the pre-push adversarial review.
 Each test names the defect it pins down; if one of these fails, that exact
 bug is back."""
-import asyncio
 import json
 import sys
 from pathlib import Path

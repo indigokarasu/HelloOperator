@@ -7,7 +7,6 @@ counts, so tests control classification exactly.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import math
 import socket
