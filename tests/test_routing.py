@@ -360,7 +360,7 @@ def test_decision_log_written(tmp_path):
         async with RouterEnv(tmp_path, two_model_cfg(tmp_path), backend) as env:
             await env.chat([{"role": "user", "content": "hello chat weather"}],
                            session="s1")
-        lines = [json.loads(l) for l in
+        lines = [json.loads(line) for line in
                  (tmp_path / "decisions.jsonl").read_text().splitlines()]
         assert lines and lines[-1]["role"] == "chat"
         assert lines[-1]["decision"] == "new"
