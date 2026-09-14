@@ -10,7 +10,8 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent))
 
 from hello_operator import config as config_mod
-from hello_operator.affinity import derive_session_key
+import time
+from hello_operator.affinity import AffinityMap, derive_session_key
 from hello_operator.capabilities import extract_props, model_ok
 from hello_operator.config import ConfigError, Settings
 from hello_operator.escalate import (StreamCollector, calls_signature,
@@ -234,3 +235,23 @@ def test_session_key_priority():
     k2 = derive_session_key({}, {"messages": [{"role": "user", "content": "hi"},
                                               {"role": "assistant", "content": "yo"}]}, s)
     assert k1 == k2 and k1.startswith("hist:")   # stable across appended turns
+
+
+def test_affinity_map_ensure_initializes_last_seen():
+    s = Settings(affinity_idle_timeout_s=3600.0)
+    am = AffinityMap(s)
+    t_before = time.monotonic()
+    st = am.ensure("hdr:test-1")
+    t_after = time.monotonic()
+
+    assert st.key == "hdr:test-1"
+    assert t_before <= st.last_seen <= t_after
+    assert am.get("hdr:test-1") is st
+
+
+def test_affinity_map_expiry_and_sweep():
+    s = Settings(affinity_idle_timeout_s=0.1)
+    am = AffinityMap(s)
+    am.ensure("hdr:test-2")
+    time.sleep(0.15)
+    assert am.get("hdr:test-2") is None
