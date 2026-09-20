@@ -69,6 +69,8 @@ class ModelSpec:
     probe: Optional[bool] = None  # None => default: probes off for on-demand
                                   # AND for remote models (each probe costs money)
     provenance: dict[str, str] = field(default_factory=dict)
+    price_in: float = 0.0    # USD per 1M prompt tokens, operator-declared
+    price_out: float = 0.0   # USD per 1M completion tokens
 
     @property
     def probes_enabled(self) -> bool:
@@ -116,6 +118,7 @@ class Settings:
     repeat_call_threshold: int = 3
     refusal_markers: list[str] = field(default_factory=list)  # MAY; empty = off
     denylist: list[str] = field(default_factory=list)  # operator-banned models
+    budget_daily_usd: float = 0.0   # 0 disables; otherwise a hard per-UTC-day ceiling
     refusal_escalate: bool = False        # advisory only unless explicitly enabled
     decision_log: str = ""                # path; empty disables (FR-11)
     state_dir: str = "~/.hello-operator"
@@ -215,7 +218,9 @@ def _parse_model(key: str, raw: dict, detected: dict, warnings: list) -> ModelSp
     return ModelSpec(key=key, id=str(mid), endpoint=str(endpoint).rstrip("/"),
                      capabilities=set(caps), context_window=int(ctx),
                      residency=residency, speed_class=speed, api_key=api_key,
-                     location=location, probe=raw.get("probe"), provenance=prov)
+                     location=location, probe=raw.get("probe"), provenance=prov,
+                     price_in=float(raw.get("price_in") or 0),
+                     price_out=float(raw.get("price_out") or 0))
 
 
 def _parse_settings(raw_router: dict, raw_routing: dict) -> Settings:
@@ -247,6 +252,8 @@ def _parse_settings(raw_router: dict, raw_routing: dict) -> Settings:
             setattr(s, name, bool(raw_router[name]))
     if "refusal_markers" in raw_router:
         s.refusal_markers = [str(x) for x in (raw_router["refusal_markers"] or [])]
+    if "budget_daily_usd" in raw_router:
+        s.budget_daily_usd = float(raw_router["budget_daily_usd"] or 0)
     if "denylist" in raw_router:
         # Matched as a case-insensitive substring of the BACKEND id, so one entry
         # ("ling-3.0-flash-sante") bans that model on every provider serving it.

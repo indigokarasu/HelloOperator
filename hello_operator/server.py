@@ -28,6 +28,7 @@ from .classify import Classifier
 from .config import Config, ModelSpec, RoleSpec
 from .escalate import (StreamCollector, calls_signature, missing_required_call,
                        refusal_matches, validate_tool_calls)
+from .budget import Budget, estimate_usd, response_cost
 from .logging_ import DecisionLog
 
 log = logging.getLogger("router.server")
@@ -100,6 +101,10 @@ class Router:
         self.decisions = DecisionLog(cfg.settings.decision_log)
         self.last_served: Optional[dict] = None      # most recent, ANY session
         self._served_by_session: dict[str, dict] = {}
+        self.budget = Budget(
+            os.path.join(os.path.expanduser(cfg.settings.state_dir or "~/.hello-operator"),
+                         "budget.json"),
+            cfg.settings.budget_daily_usd)
         self.http: Optional[aiohttp.ClientSession] = None
         self.classifier: Optional[Classifier] = None
         self._sem: Optional[asyncio.Semaphore] = (
@@ -530,6 +535,19 @@ class Router:
                               candidates, stream, buffered, routing_ms):
         last_error = "no candidates"
         for i, (spec, role, pos) in enumerate(candidates):
+            if not _is_free(spec) and self.budget.enabled:
+                # Pre-flight: refuse BEFORE spending. Post-hoc accounting cannot
+                # stop the single 131k-max_tokens call that empties the account,
+                # which is precisely how this budget came to exist.
+                _est = estimate_usd(spec, getattr(props, "est_tokens", 0),
+                                    getattr(props, "max_tokens", 0))
+                if self.budget.would_exceed(_est):
+                    last_error = ("%s: refused, est $%.4f exceeds the $%.4f remaining "
+                                  "of today's $%.2f budget"
+                                  % (spec.key, _est, self.budget.remaining(),
+                                     self.budget.daily_usd))
+                    log.warning("budget: %s", last_error)
+                    continue
             if _denied(spec, self.cfg.settings.denylist):
                 # Banned models are skipped before the request is built, so a
                 # denylist entry costs nothing and cannot be reached by failover,
@@ -645,6 +663,7 @@ class Router:
         self._log_decision(st, decision, routing_ms, escalation_failures=failures)
         headers = self._router_headers(decision, routing_ms)
         assert payload is not None
+        self.budget.record(response_cost(payload))
         payload["router"] = {"model": spec.key, "backend_model": spec.id,
                              "role": decision.role, "pos": decision.pos,
                              "decision": decision.kind}
