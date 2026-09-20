@@ -38,6 +38,7 @@ DEFAULTS = {
     "enabled": True,
     "min_context": 262144,
     "require_tools": True,
+    "min_tool_score": 1,   # 0 off | 1 must emit a valid call | 2 must finish the loop
     "probe_max_tokens": 300,
     "request_timeout_s": 90,
     "provider_order": [],          # endpoint urls, most preferred first
@@ -125,6 +126,78 @@ async def _probe(http: aiohttp.ClientSession, endpoint: str, api_key: str,
     return score, (statistics.median(tps) if tps else 0.0), statistics.median(lat)
 
 
+TOOL_SPEC = [{"type": "function", "function": {
+    "name": "get_weather",
+    "description": "Get the current weather for a city",
+    "parameters": {"type": "object",
+                   "properties": {"city": {"type": "string"}},
+                   "required": ["city"]}}}]
+
+TOOL_RESULT = '{"temp_c": 18, "condition": "rain"}'
+
+
+async def _probe_tools(http: aiohttp.ClientSession, endpoint: str, api_key: str,
+                       model_id: str, cfg: dict) -> int:
+    """0 = cannot call tools, 1 = emits a valid call, 2 = also completes the loop.
+
+    Tool use is the first thing an agent's model is judged on. A model that
+    answers in prose where a tool call belongs fails every agent turn, and it
+    fails SILENTLY: the backend returns HTTP 200, so the cascade never fails
+    over and the router only escapes by escalating -- often into the paid tail.
+    Scoring terseness and arithmetic while never once calling a tool is how a
+    tool-incompetent model ends up ranked first.
+    """
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    async def post(body):
+        async with http.post(f"{endpoint.rstrip('/')}/chat/completions", headers=headers,
+                             json=body,
+                             timeout=aiohttp.ClientTimeout(total=cfg["request_timeout_s"])) as r:
+            return await r.json() if r.status == 200 else None
+
+    ask = {"role": "user",
+           "content": "What is the weather in Paris? Use the get_weather tool."}
+    budget = int(cfg["probe_max_tokens"])
+    try:
+        j = await post({"model": model_id, "messages": [ask], "tools": TOOL_SPEC,
+                        "max_tokens": budget})
+        msg = j["choices"][0]["message"] if j else None
+    except Exception as e:  # noqa: BLE001 - an unusable model must not break the run
+        log.info("ranking: %s tool probe failed: %s", model_id, e)
+        return 0
+    if not msg:
+        return 0
+
+    calls = msg.get("tool_calls") or []
+    if not calls:
+        return 0
+    fn = calls[0].get("function") or {}
+    if fn.get("name") != "get_weather":
+        return 0
+    try:
+        args = json.loads(fn.get("arguments") or "{}")
+    except (TypeError, ValueError):
+        return 0
+    if not isinstance(args, dict) or "paris" not in str(args.get("city", "")).lower():
+        return 0
+
+    # Second half: can it consume a tool RESULT and finish the turn? Plenty of
+    # models emit a call and then choke on the tool message that follows, which
+    # is exactly the step every agent loop depends on.
+    try:
+        j2 = await post({"model": model_id, "tools": TOOL_SPEC, "max_tokens": budget,
+                         "messages": [ask, msg,
+                                      {"role": "tool",
+                                       "tool_call_id": calls[0].get("id") or "call_1",
+                                       "name": "get_weather", "content": TOOL_RESULT}]})
+        text = (j2["choices"][0]["message"].get("content") or "") if j2 else ""
+    except Exception:  # noqa: BLE001
+        return 1
+    return 2 if ("18" in text or "rain" in text.lower()) else 1
+
+
 async def rank(http: aiohttp.ClientSession, raw_cfg: dict, keys: dict) -> dict:
     """Rank the free models of every configured provider. Returns
     {endpoint: [ {id, score, tok_s, latency, context}, ... ]} best first."""
@@ -147,9 +220,16 @@ async def rank(http: aiohttp.ClientSession, raw_cfg: dict, keys: dict) -> dict:
             if measured is None:
                 continue
             score, tok_s, latency = measured
+            tools = await _probe_tools(http, endpoint, api_key, mid, s)
+            if tools < int(s["min_tool_score"]):
+                log.info("ranking: %s scored %d on tool use, dropped", mid, tools)
+                continue
             rows.append({"id": mid, "score": score, "tok_s": round(tok_s, 1),
-                         "latency": round(latency, 2), "context": _ctx(entry)})
-        rows.sort(key=lambda r: (-r["score"], -r["tok_s"], -r["context"]))
+                         "latency": round(latency, 2), "context": _ctx(entry),
+                         "tools": tools})
+        # Tool ability outranks everything: for an agent it is the capability the
+        # others are useless without.
+        rows.sort(key=lambda r: (-r.get("tools", 0), -r["score"], -r["tok_s"], -r["context"]))
         out[endpoint] = rows
         log.info("ranking: %s -> %d usable free model(s)", endpoint, len(rows))
     return out
@@ -194,7 +274,8 @@ def apply_ranking(config_path: str, ranked: dict, raw_cfg: dict) -> tuple[bool, 
             variants.setdefault(row["id"], []).append((endpoint, row))
 
     def _best(vs):
-        return max((v[1]["score"], v[1]["tok_s"], v[1]["context"]) for v in vs)
+        return max((v[1].get("tools", 0), v[1]["score"], v[1]["tok_s"], v[1]["context"])
+                   for v in vs)
 
     free_keys: list[str] = []
     taken = set(models)
@@ -207,7 +288,7 @@ def apply_ranking(config_path: str, ranked: dict, raw_cfg: dict) -> tuple[bool, 
             # the operator banned, and the ban would last exactly one day.
             log.info("ranking: %s is denylisted, skipping", model_id)
             continue
-        vs.sort(key=lambda ev: (-ev[1]["score"], -ev[1]["tok_s"],
+        vs.sort(key=lambda ev: (-ev[1].get("tools", 0), -ev[1]["score"], -ev[1]["tok_s"],
                                 order.index(ev[0]) if ev[0] in order else 99))
         for endpoint, row in vs:
             key = by_id_ep.get((model_id, endpoint))
@@ -239,7 +320,20 @@ def apply_ranking(config_path: str, ranked: dict, raw_cfg: dict) -> tuple[bool, 
         paid_tail = [k for k in cascade
                      if k in models and models[k].get("id") not in ranked_ids
                      and not str(models[k].get("id", "")).endswith(":free")]
-        new_cascade = free_keys + paid_tail
+        # A free model that could not be probed this run -- rate-capped (429),
+        # forbidden (403), timed out -- is UNKNOWN, not bad. Dropping it lets one
+        # transient cap quietly shrink the cascade, which is how a fleet ends up
+        # one outage away from the paid tail. Keep it, below everything proven.
+        unproven = [k for k in cascade
+                    if k in models and k not in free_keys
+                    and str(models[k].get("id", "")).endswith(":free")
+                    and models[k].get("id") not in ranked_ids
+                    and not (deny and any(d in str(models[k].get("id", "")).lower()
+                                          for d in deny))]
+        if unproven:
+            log.info("ranking: %d model(s) unprobeable this run, retained below the "
+                     "ranked ones: %s", len(unproven), ", ".join(unproven))
+        new_cascade = free_keys + unproven + paid_tail
         if new_cascade != cascade:
             changed = True
         roles[role] = {**(spec or {}), "cascade": new_cascade}
@@ -273,5 +367,6 @@ def format_report(ranked: dict) -> str:
         lines.append(f"{endpoint}  ({len(rows)} usable free)")
         for i, r in enumerate(rows, 1):
             lines.append(f"  {i:>2}. {r['id']:<46} score={r['score']}/{len(PROBES)} "
-                         f"{r['tok_s']:>7.1f} tok/s  p50={r['latency']:>5.2f}s  ctx={r['context']:,}")
+                         f"{r['tok_s']:>7.1f} tok/s  p50={r['latency']:>5.2f}s  ctx={r['context']:,}"
+                         f"  tools={r.get('tools', 0)}/2")
     return "\n".join(lines) or "no free models discovered"
