@@ -65,6 +65,34 @@ async def _discover(cfg: Config, probe: bool, out: str) -> int:
     return 0
 
 
+
+async def _rank_free(cfg: Config, apply: bool) -> int:
+    """Rediscover + re-rank each provider's free models (owner directive).
+
+    Keys come from the already-resolved model specs, so a provider is probed
+    with exactly the credential the router would use at request time.
+    """
+    import yaml as _yaml
+
+    from . import ranking
+    raw = _yaml.safe_load(open(cfg.source_path)) or {}
+    keys = {}
+    for spec in cfg.models.values():
+        if getattr(spec, "api_key", None):
+            keys.setdefault(spec.endpoint, spec.api_key)
+    if not ranking.settings(raw).get("provider_order"):
+        print("ranking.provider_order is empty — nothing to rank")
+        return 0
+    async with aiohttp.ClientSession() as http:
+        ranked = await ranking.rank(http, raw, keys)
+    print(ranking.format_report(ranked))
+    if not apply:
+        print("\n(report only — pass --apply to rewrite the cascades)")
+        return 0
+    changed, note = ranking.apply_ranking(cfg.source_path, ranked, raw)
+    print(f"\n{'changed' if changed else 'unchanged'}: {note}")
+    return 0
+
 async def _pre_serve(cfg: Config) -> Config:
     """Startup detection, endpoint validation, and drift flagging.
 
@@ -117,6 +145,11 @@ def main(argv: list[str] | None = None) -> int:
                          "(forces a load on on-demand models unless disabled per model)")
     ap.add_argument("--out", default="", help="with --discover: write proposal here")
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--rank-free", action="store_true",
+                    help="probe every provider's free models and rank them "
+                         "(correctness, then throughput, then context)")
+    ap.add_argument("--apply", action="store_true",
+                    help="with --rank-free: rewrite the free half of each cascade")
     args = ap.parse_args(argv)
 
     logging.basicConfig(
@@ -134,6 +167,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.check:
         return asyncio.run(_check(cfg, probe=args.probe))
+    if args.rank_free:
+        return asyncio.run(_rank_free(cfg, args.apply))
     if args.discover:
         return asyncio.run(_discover(cfg, probe=args.probe, out=args.out))
 

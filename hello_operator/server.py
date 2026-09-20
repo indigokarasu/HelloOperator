@@ -7,6 +7,8 @@ single-model path skips selection entirely (NFR-7).
 """
 from __future__ import annotations
 
+import os
+
 import asyncio
 import hashlib
 import json
@@ -32,6 +34,34 @@ log = logging.getLogger("router.server")
 HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
               "te", "trailers", "transfer-encoding", "upgrade", "content-length",
               "content-encoding", "host"}
+
+
+# --- provider-wide free-tier breaker -------------------------------------
+# Free tiers are exhausted PER PROVIDER, not per model: when one free model
+# answers 402/429, its siblings on the same endpoint almost always answer the
+# same way (owner observation, 2026-09-19). Without this, a capped provider
+# costs one wasted round-trip per free model on every request. Not always true,
+# so it is a timed breaker, never a permanent demotion.
+_FREE_EXHAUSTED: dict[str, float] = {}
+_FREE_COOLDOWN_S = float(os.environ.get("HELLO_OPERATOR_FREE_COOLDOWN_S", "900"))
+
+
+def _is_free(spec) -> bool:
+    return str(getattr(spec, "id", "")).endswith(":free")
+
+
+def free_exhausted(endpoint: str) -> bool:
+    until = _FREE_EXHAUSTED.get(endpoint, 0.0)
+    if until and until > time.monotonic():
+        return True
+    _FREE_EXHAUSTED.pop(endpoint, None)
+    return False
+
+
+def mark_free_exhausted(endpoint: str, cooldown: float | None = None) -> None:
+    _FREE_EXHAUSTED[endpoint] = time.monotonic() + (cooldown or _FREE_COOLDOWN_S)
+    log.warning("free tier on %s looks exhausted; skipping its other free models "
+                "for %.0fs", endpoint, cooldown or _FREE_COOLDOWN_S)
 
 
 @dataclass
@@ -424,6 +454,9 @@ class Router:
                               candidates, stream, buffered, routing_ms):
         last_error = "no candidates"
         for i, (spec, role, pos) in enumerate(candidates):
+            if _is_free(spec) and free_exhausted(spec.endpoint):
+                last_error = f"{spec.key}: free tier on {spec.endpoint} exhausted"
+                continue
             if i > 0:
                 decision = Decision(spec=spec, role=role, pos=pos,
                                     kind="failover", trigger="backend-unreachable")
@@ -442,6 +475,8 @@ class Router:
                 continue
             except _RetryableStatus as e:
                 last_error = f"{spec.key}: backend returned {e.status}"
+                if e.status in (402, 429) and _is_free(spec):
+                    mark_free_exhausted(spec.endpoint)
                 continue
         # FR-9: never silently fail without naming what went wrong.
         return _err(502, f"no backend could serve the request; last error: {last_error}",
