@@ -84,6 +84,8 @@ class Decision:
     kind: str = ""           # new | affinity | transition:<t> | escalation:<t> | pin | degenerate
     trigger: str = ""
     hops_to_charge: int = 0  # committed to the session only when the turn serves
+    est_usd: float = 0.0     # pre-flight worst-case cost of this candidate
+    actual_usd: float = 0.0  # cost the backend reported, when it reported one
     error_status: int = 0
     error_message: str = ""
     reasons: list[str] = field(default_factory=list)
@@ -555,28 +557,11 @@ class Router:
                               candidates, stream, buffered, routing_ms):
         last_error = "no candidates"
         for i, (spec, role, pos) in enumerate(candidates):
-            if not _is_free(spec) and self.budget.enabled:
-                # Pre-flight: refuse BEFORE spending. Post-hoc accounting cannot
-                # stop the single 131k-max_tokens call that empties the account,
-                # which is precisely how this budget came to exist.
-                _priced = (float(getattr(spec, "price_in", 0) or 0) > 0
-                           or float(getattr(spec, "price_out", 0) or 0) > 0)
-                if not _priced:
-                    # Unknown cost is not free cost. A paid model nobody priced is
-                    # exactly how an unbounded model reaches a budgeted fleet.
-                    last_error = ("%s: refused, no price declared and a budget is set"
-                                  % spec.key)
-                    log.warning("budget: %s", last_error)
-                    continue
-                _est = estimate_usd(spec, getattr(props, "est_tokens", 0),
-                                    getattr(props, "max_tokens", 0))
-                if self.budget.would_exceed(_est):
-                    last_error = ("%s: refused, est $%.4f exceeds the $%.4f remaining "
-                                  "of today's $%.2f budget"
-                                  % (spec.key, _est, self.budget.remaining(),
-                                     self.budget.daily_usd))
-                    log.warning("budget: %s", last_error)
-                    continue
+            _refusal = self._budget_refusal(spec, props, decision)
+            if _refusal:
+                last_error = _refusal
+                log.warning("budget: %s", _refusal)
+                continue
             if _denied(spec, self.cfg.settings.denylist):
                 # Banned models are skipped before the request is built, so a
                 # denylist entry costs nothing and cannot be reached by failover,
@@ -673,6 +658,15 @@ class Router:
                     and st.hops_used + decision.hops_to_charge < cfg.settings.hop_limit):
                 nxt = self._next_capable(decision, props)
                 if nxt is not None:
+                    # The escalation hop re-dispatches directly, so without this it
+                    # skips the pre-flight gate entirely -- and it escalates UPWARD
+                    # in cascade position, i.e. toward the expensive end. A budget
+                    # that the escalation path can walk around is not a budget.
+                    _esc_refusal = self._budget_refusal(nxt[0], props)
+                    if _esc_refusal:
+                        log.warning("budget: escalation blocked: %s", _esc_refusal)
+                        nxt = None
+                if nxt is not None:
                     prev = (spec, decision, payload, message, failures)
                     log.info("in-request escalation (%s) -> '%s': %s",
                              decision.kind, nxt[0].key, "; ".join(failures))
@@ -692,7 +686,7 @@ class Router:
         self._log_decision(st, decision, routing_ms, escalation_failures=failures)
         headers = self._router_headers(decision, routing_ms)
         assert payload is not None
-        self.budget.record(response_cost(payload))
+        decision.actual_usd = response_cost(payload, spec)
         payload["router"] = {"model": spec.key, "backend_model": spec.id,
                              "role": decision.role, "pos": decision.pos,
                              "decision": decision.kind}
@@ -860,8 +854,42 @@ class Router:
             "x-router-latency-ms": str(routing_ms),
         }
 
+    def _budget_refusal(self, spec, props, decision=None) -> Optional[str]:
+        """Reason this paid candidate must not be called, or None to allow it.
+
+        Every path that can dispatch to a backend has to consult this, not just
+        the candidate loop: the in-request escalation hop dispatches on its own.
+        """
+        if _is_free(spec) or not self.budget.enabled:
+            return None
+        priced = (float(getattr(spec, "price_in", 0) or 0) > 0
+                  or float(getattr(spec, "price_out", 0) or 0) > 0)
+        if not priced:
+            # Unknown cost is not free cost.
+            return "%s: refused, no price declared and a budget is set" % spec.key
+        est = estimate_usd(spec, getattr(props, "est_tokens", 0),
+                           getattr(props, "max_tokens", 0))
+        if decision is not None:
+            decision.est_usd = est
+        if self.budget.would_exceed(est):
+            return ("%s: refused, est $%.4f exceeds the $%.4f remaining of today's "
+                    "$%.2f budget" % (spec.key, est, self.budget.remaining(),
+                                      self.budget.daily_usd))
+        return None
+
     def _log_decision(self, st: Optional[SessionState], decision: Decision,
                       routing_ms: float, escalation_failures: list[str]) -> None:
+        # Charge the budget HERE, because this is the one place both the buffered
+        # and the streaming path pass through. Recording only in the buffered path
+        # let every streamed turn spend unmetered -- and Hermes streams, so the
+        # ceiling read $0.000133 while the account actually lost about $5.
+        # A streamed relay never yields a usage block we can trust, so fall back to
+        # the pre-flight estimate: over-counting refuses too early, under-counting
+        # does not refuse at all, and only one of those failures costs money.
+        if decision.spec is not None and not _is_free(decision.spec):
+            _charge = decision.actual_usd or decision.est_usd
+            if _charge:
+                self.budget.record(_charge)
         if decision.spec is not None:
             # Same choke point the decision log uses, so the status endpoint and
             # the log can never disagree about who served.

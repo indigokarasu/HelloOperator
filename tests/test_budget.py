@@ -138,3 +138,165 @@ def test_unpriced_paid_model_is_allowed_when_no_budget_is_set(tmp_path):
     status, payload, _ = _ask_unpriced(tmp_path, _cfg_unpriced(tmp_path))
     assert status == 200
     assert payload["router"]["backend_model"] == "vendor/mystery-premium"
+
+# ------------------------------------------- streamed turns must also be charged
+
+def _priced_cfg(tmp_path, **router):
+    """Paid model first, prices declared, ledger written into tmp_path."""
+    models = {
+        "paid": {"id": "vendor/premium", "endpoint": "BACKEND",
+                 "capabilities": ["text", "tools", "json"], "context_window": 131072,
+                 "price_in": 10.0, "price_out": 50.0},
+        "free": {"id": "vendor/cheap:free", "endpoint": "BACKEND",
+                 "capabilities": ["text", "tools", "json"], "context_window": 131072},
+    }
+    roles = {"chat": {"cascade": ["paid", "free"], "utterances": CHAT_UTTERANCES}}
+    return base_config(tmp_path, models=models, roles=roles, default_role="chat",
+                       state_dir=str(tmp_path), **router)
+
+
+def _spent(tmp_path):
+    import json as _j
+    p = tmp_path / "budget.json"
+    if not p.exists():
+        return 0.0
+    try:
+        return float(_j.loads(p.read_text()).get("spent_usd") or 0)
+    except Exception:
+        return 0.0
+
+
+def _run_turn(tmp_path, cfg, stream):
+    async def scenario():
+        backend = FakeBackend({"vendor/premium": _echo("premium"),
+                               "vendor/cheap:free": _echo("cheap")})
+        async with RouterEnv(tmp_path, cfg, backend) as env:
+            return await env.chat([{"role": "user", "content": "hello chat"}], stream=stream)
+    return run(scenario())
+
+
+def test_a_streamed_paid_turn_is_charged_to_the_budget(tmp_path):
+    """The defect: cost was recorded only on the buffered path, so every streamed
+    turn spent unmetered and the ceiling never bound. Hermes streams."""
+    cfg = _priced_cfg(tmp_path, budget_daily_usd=10_000)
+    status, payload, _ = _run_turn(tmp_path, cfg, stream=True)
+    assert status == 200
+    assert _spent(tmp_path) > 0, "a streamed paid turn was served without charging the budget"
+
+
+def test_a_buffered_paid_turn_is_charged_to_the_budget(tmp_path):
+    cfg = _priced_cfg(tmp_path, budget_daily_usd=10_000)
+    status, payload, _ = _run_turn(tmp_path, cfg, stream=False)
+    assert status == 200
+    assert _spent(tmp_path) > 0
+
+
+def test_a_free_turn_is_never_charged(tmp_path):
+    """Control: only paid backends move the ledger."""
+    models = {"free": {"id": "vendor/cheap:free", "endpoint": "BACKEND",
+                       "capabilities": ["text", "tools", "json"], "context_window": 131072},
+              "free2": {"id": "vendor/other:free", "endpoint": "BACKEND",
+                        "capabilities": ["text", "tools", "json"], "context_window": 131072}}
+    roles = {"chat": {"cascade": ["free", "free2"], "utterances": CHAT_UTTERANCES}}
+    cfg = base_config(tmp_path, models=models, roles=roles, default_role="chat",
+                      state_dir=str(tmp_path), budget_daily_usd=10_000)
+
+    async def scenario():
+        backend = FakeBackend({"vendor/cheap:free": _echo("cheap"),
+                               "vendor/other:free": _echo("other")})
+        async with RouterEnv(tmp_path, cfg, backend) as env:
+            return await env.chat([{"role": "user", "content": "hello chat"}], stream=True)
+    status, _, _ = run(scenario())
+    assert status == 200
+    assert _spent(tmp_path) == 0.0
+
+# --------------------------------- the escalation hop must honour the budget
+
+def test_escalation_hop_cannot_walk_around_the_budget(tmp_path):
+    """The in-request escalation re-dispatches on its own, so it skipped the
+    pre-flight gate -- and it escalates UPWARD in price. A budget the escalation
+    path can walk around is not a budget."""
+    from helpers import WEATHER_TOOL, bad_json_call
+    models = {
+        "free": {"id": "vendor/cheap:free", "endpoint": "BACKEND",
+                 "capabilities": ["text", "tools", "json"], "context_window": 131072},
+        "paid": {"id": "vendor/premium", "endpoint": "BACKEND",
+                 "capabilities": ["text", "tools", "json"], "context_window": 131072,
+                 "price_in": 10.0, "price_out": 50.0},
+    }
+    roles = {"chat": {"cascade": ["free", "paid"], "utterances": CHAT_UTTERANCES}}
+    cfg = base_config(tmp_path, models=models, roles=roles, default_role="chat",
+                      state_dir=str(tmp_path), budget_daily_usd=0.0001, hop_limit=2)
+
+    async def scenario():
+        # the free model emits an unparseable tool call, which is what arms the
+        # in-request escalation toward the next (paid) cascade position
+        backend = FakeBackend({"vendor/cheap:free": bad_json_call,
+                               "vendor/premium": bad_json_call})
+        async with RouterEnv(tmp_path, cfg, backend) as env:
+            await env.chat([{"role": "user", "content": "weather in paris?"}],
+                           tools=WEATHER_TOOL)
+        return backend.per_model_calls
+    calls = run(scenario())
+    assert calls.get("vendor/premium", 0) == 0, (
+        "escalation reached the paid model despite an exhausted budget: %s" % calls)
+    assert calls.get("vendor/cheap:free", 0) >= 1
+
+
+def test_escalation_hop_is_allowed_when_the_budget_covers_it(tmp_path):
+    """Control: the block above must be the budget, not escalation being broken."""
+    from helpers import WEATHER_TOOL, bad_json_call
+    models = {
+        "free": {"id": "vendor/cheap:free", "endpoint": "BACKEND",
+                 "capabilities": ["text", "tools", "json"], "context_window": 131072},
+        "paid": {"id": "vendor/premium", "endpoint": "BACKEND",
+                 "capabilities": ["text", "tools", "json"], "context_window": 131072,
+                 "price_in": 0.01, "price_out": 0.01},
+    }
+    roles = {"chat": {"cascade": ["free", "paid"], "utterances": CHAT_UTTERANCES}}
+    cfg = base_config(tmp_path, models=models, roles=roles, default_role="chat",
+                      state_dir=str(tmp_path), budget_daily_usd=10_000, hop_limit=2)
+
+    async def scenario():
+        backend = FakeBackend({"vendor/cheap:free": bad_json_call,
+                               "vendor/premium": bad_json_call})
+        async with RouterEnv(tmp_path, cfg, backend) as env:
+            await env.chat([{"role": "user", "content": "weather in paris?"}],
+                           tools=WEATHER_TOOL)
+        return backend.per_model_calls
+    calls = run(scenario())
+    assert calls.get("vendor/premium", 0) >= 1, (
+        "escalation never reached the paid model, so the test above proves nothing: %s" % calls)
+
+
+# ------------------------- cost must be derived when the backend reports none
+
+def test_cost_is_derived_from_tokens_when_the_backend_reports_none():
+    """usage.cost is an OpenRouter extension; everyone else reports only tokens."""
+    from hello_operator.budget import response_cost
+
+    class _S:
+        price_in, price_out = 10.0, 50.0
+
+    payload = {"usage": {"prompt_tokens": 100_000, "completion_tokens": 2_000}}
+    got = response_cost(payload, _S())
+    assert round(got, 6) == round((100_000 * 10 + 2_000 * 50) / 1e6, 6), got
+
+
+def test_reported_cost_wins_over_the_derived_one():
+    from hello_operator.budget import response_cost
+
+    class _S:
+        price_in, price_out = 10.0, 50.0
+
+    payload = {"usage": {"cost": 0.25, "prompt_tokens": 100_000, "completion_tokens": 2_000}}
+    assert response_cost(payload, _S()) == 0.25
+
+
+def test_no_price_and_no_reported_cost_is_zero():
+    from hello_operator.budget import response_cost
+
+    class _S:
+        price_in, price_out = 0.0, 0.0
+
+    assert response_cost({"usage": {"prompt_tokens": 100_000}}, _S()) == 0.0

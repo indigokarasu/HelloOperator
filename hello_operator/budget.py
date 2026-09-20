@@ -135,10 +135,37 @@ def estimate_usd(spec, est_prompt_tokens: int, max_tokens: int) -> float:
             + max(0, int(max_tokens or 0)) * p_out) / 1_000_000.0
 
 
-def response_cost(payload: dict) -> float:
-    """Actual cost OpenRouter reports on a response, when it reports one."""
+def response_cost(payload: dict, spec=None) -> float:
+    """What the turn actually cost.
+
+    ``usage.cost`` is an OpenRouter extension. Every other OpenAI-compatible
+    backend (DeepSeek direct, Together, Groq, vLLM, llama.cpp) omits it, and
+    reading only that field means those providers debit $0 forever while the
+    ceiling reports itself untouched. So fall back to the reported token counts
+    priced at the operator's declared rate.
+
+    reasoning tokens are already counted inside ``completion_tokens`` on both
+    OpenAI and DeepSeek, so they are deliberately NOT added again.
+    """
     try:
         usage = (payload or {}).get("usage") or {}
-        return float(usage.get("cost") or 0)
-    except (AttributeError, TypeError, ValueError):
+    except AttributeError:
         return 0.0
+    try:
+        reported = float(usage.get("cost") or 0)
+    except (TypeError, ValueError):
+        reported = 0.0
+    if reported > 0:
+        return reported
+    if spec is None:
+        return 0.0
+    p_in = float(getattr(spec, "price_in", 0) or 0)
+    p_out = float(getattr(spec, "price_out", 0) or 0)
+    if p_in <= 0 and p_out <= 0:
+        return 0.0
+    try:
+        tok_in = int(usage.get("prompt_tokens") or 0)
+        tok_out = int(usage.get("completion_tokens") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return (tok_in * p_in + tok_out * p_out) / 1_000_000.0
