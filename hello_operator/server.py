@@ -626,7 +626,7 @@ class Router:
                             "the previous answer and arming the next turn (FR-9)")
                 break
             async with client_resp:
-                if client_resp.status >= 500 or client_resp.status in (402, 429):
+                if client_resp.status >= 500 or client_resp.status in _RETRYABLE_STATUSES:
                     # 5xx: backend broken. 402/429: quota or rate cap — on a
                     # free-tier fleet a daily cap answers 429 all day, and the
                     # whole point of the cascade is that the next provider
@@ -705,7 +705,7 @@ class Router:
         spec = decision.spec
         assert spec is not None
         client_resp = await self._post_backend(request, spec, body, stream=True)
-        if client_resp.status >= 500 or client_resp.status in (402, 429):
+        if client_resp.status >= 500 or client_resp.status in _RETRYABLE_STATUSES:
             client_resp.close()
             raise _RetryableStatus(client_resp.status)
         collector = StreamCollector()
@@ -936,6 +936,14 @@ class _RetryableStatus(Exception):
 # router is active they all read "hello-operator" and the backend that actually
 # answered -- the one that decides whether a turn is free or paid -- is invisible.
 # /v1/status reports it; these names make it readable.
+# A cascade exists so that one backend's problem is not the turn's problem. 402 and
+# 429 were retryable, but 401/403/404 were not -- so a single stale credential or a
+# model whose free period ended failed the whole turn instead of falling through to
+# the ten other free models sitting right behind it. Observed twice in one night:
+# "404: This model's free period has ended" killed a job outright, and "401: User
+# not found" from one endpoint failed turns while every other backend was healthy.
+_RETRYABLE_STATUSES = (401, 402, 403, 404, 408, 409, 429)
+
 _SERVED_CAP = 512   # bound the per-session status store
 
 _PROVIDER_LABELS = {
