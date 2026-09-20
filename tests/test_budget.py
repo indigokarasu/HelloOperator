@@ -3,6 +3,7 @@
 Each test puts the PAID model first in the cascade, so a pass cannot be confused
 with "the free one was chosen anyway".
 """
+import json
 import sys
 from pathlib import Path
 
@@ -300,3 +301,54 @@ def test_no_price_and_no_reported_cost_is_zero():
         price_in, price_out = 0.0, 0.0
 
     assert response_cost({"usage": {"prompt_tokens": 100_000}}, _S()) == 0.0
+
+
+# ------------------------------------------- the ledger books what was spent
+
+def _cost_cfg(tmp_path, **router):
+    """One paid model only, priced high, so the estimate and the reported cost
+    are far apart and cannot be confused for each other."""
+    models = {
+        "paid": {"id": "vendor/premium", "endpoint": "BACKEND",
+                 "capabilities": ["text", "tools", "json"], "context_window": 131072,
+                 "price_in": 10.0, "price_out": 50.0},
+    }
+    roles = {"chat": {"cascade": ["paid"], "utterances": CHAT_UTTERANCES}}
+    return base_config(tmp_path, models=models, roles=roles, default_role="chat",
+                       **router)
+
+
+def test_ledger_books_the_reported_cost_not_the_estimate(tmp_path):
+    """On the buffered path the backend tells us what the turn actually cost.
+
+    Booking the worst-case pre-flight estimate instead spends the daily ceiling
+    on money that was never billed: 473 real calls booked $1.91 against cents
+    actually spent, which retires the paid tier ~2/3 through the day for no
+    reason. The estimate is the fallback for streamed turns, not the default.
+    """
+    REPORTED = 0.000012
+
+    def priced(body, idx):
+        return {"content": "answer",
+                "usage": {"prompt_tokens": 2000, "completion_tokens": 40,
+                          "total_tokens": 2040, "cost": REPORTED}}
+
+    cfg = _cost_cfg(tmp_path, budget_daily_usd=10_000)
+
+    async def scenario():
+        backend = FakeBackend({"vendor/premium": priced})
+        async with RouterEnv(tmp_path, cfg, backend) as env:
+            return await env.chat([{"role": "user", "content": "hello chat"}],
+                                  max_tokens=8192)
+    status, payload, _ = run(scenario())
+    assert status == 200
+    assert payload["router"]["backend_model"] == "vendor/premium"
+
+    ledger = json.loads((tmp_path / "state" / "budget.json").read_text())
+    spent = ledger["spent_usd"]
+
+    estimate = estimate_usd(_Spec(10.0, 50.0), 2000, 8192)
+    assert estimate > REPORTED * 100, "test is meaningless unless the two differ"
+    assert abs(spent - REPORTED) < 1e-9, (
+        f"ledger booked ${spent:.6f}; the backend reported ${REPORTED:.6f} "
+        f"(pre-flight estimate was ${estimate:.6f})")

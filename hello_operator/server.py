@@ -675,6 +675,13 @@ class Router:
                                         kind="escalation:tool-validation",
                                         trigger="tool-validation",
                                         hops_to_charge=decision.hops_to_charge + 1)
+                    # The gate above was consulted without a decision to write the
+                    # estimate to, so this hop carried none. If the hop then streams
+                    # (no usage block to read), nothing is charged at all: a hop
+                    # that escalates toward the expensive end and bills nothing is
+                    # a hole in the ceiling, not a missing log field.
+                    decision.est_usd = estimate_usd(spec, props.est_tokens,
+                                                    props.max_tokens)
                     continue
             break
 
@@ -683,10 +690,16 @@ class Router:
             # The served answer still fails validation (hop-capped, escalated
             # model failed too, or its backend was down): arm the next turn.
             st.pending_escalation = st.pending_escalation or "tool-validation"
-        self._log_decision(st, decision, routing_ms, escalation_failures=failures)
-        headers = self._router_headers(decision, routing_ms)
+        # The backend just told us what the turn cost. Read it BEFORE charging:
+        # _log_decision books actual_usd or falls back to the worst-case estimate,
+        # so computing it afterwards left the fallback permanently in charge and
+        # billed every buffered turn at full max_tokens. 473 real calls booked
+        # $1.91 against cents actually spent, retiring the paid tier 2/3 of the
+        # way through the day for spend that never happened.
         assert payload is not None
         decision.actual_usd = response_cost(payload, spec)
+        self._log_decision(st, decision, routing_ms, escalation_failures=failures)
+        headers = self._router_headers(decision, routing_ms)
         payload["router"] = {"model": spec.key, "backend_model": spec.id,
                              "role": decision.role, "pos": decision.pos,
                              "decision": decision.kind}

@@ -111,7 +111,8 @@ class FakeBackend:
         return web.json_response({
             "id": "cc1", "object": "chat.completion", "model": model,
             "choices": [{"index": 0, "message": message, "finish_reason": finish}],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "usage": spec.get("usage") or {"prompt_tokens": 1, "completion_tokens": 1,
+                                           "total_tokens": 2},
         })
 
     async def models(self, request: web.Request) -> web.Response:
