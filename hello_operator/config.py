@@ -69,6 +69,8 @@ class ModelSpec:
     probe: Optional[bool] = None  # None => default: probes off for on-demand
                                   # AND for remote models (each probe costs money)
     provenance: dict[str, str] = field(default_factory=dict)
+    drop_params: list = field(default_factory=list)   # params this backend rejects
+    param_map: dict = field(default_factory=dict)     # {param: {from_value: to_value}}
     price_in: float = 0.0    # USD per 1M prompt tokens, operator-declared
     price_out: float = 0.0   # USD per 1M completion tokens
 
@@ -219,6 +221,8 @@ def _parse_model(key: str, raw: dict, detected: dict, warnings: list) -> ModelSp
                      capabilities=set(caps), context_window=int(ctx),
                      residency=residency, speed_class=speed, api_key=api_key,
                      location=location, probe=raw.get("probe"), provenance=prov,
+                     drop_params=list(raw.get("drop_params") or []),
+                     param_map=dict(raw.get("param_map") or {}),
                      price_in=float(raw.get("price_in") or 0),
                      price_out=float(raw.get("price_out") or 0))
 

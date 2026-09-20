@@ -353,6 +353,26 @@ class Router:
         out = dict(body)
         out["model"] = spec.id
         out.pop("session_id", None)  # router convention, not an OpenAI field
+
+        # Backends disagree about the OpenAI schema, and a rejected parameter is
+        # indistinguishable from a dead model to everything upstream: Hermes sent
+        # reasoning_effort="medium" and DeepSeek V4.1 answered HTTP 400 ("must be
+        # low, high, xhigh, max, or an integer within [1, 100]") 220 times, so the
+        # designated paid fallback never once served. Normalising here -- the only
+        # place that knows which backend the request is going to -- fixes it for
+        # every caller and survives upstream updates.
+        for _p in (spec.drop_params or []):
+            out.pop(_p, None)
+        for _p, _mapping in (spec.param_map or {}).items():
+            if _p in out and isinstance(_mapping, dict):
+                _cur = out[_p]
+                _key = "" if _cur is None else str(_cur)
+                if _key in _mapping:
+                    _new = _mapping[_key]
+                    if _new is None:
+                        out.pop(_p, None)
+                    else:
+                        out[_p] = _new
         return out
 
     async def _post_backend(self, request: web.Request, spec: ModelSpec,
