@@ -15,6 +15,7 @@ import json
 import logging
 import time
 import uuid
+from urllib.parse import urlparse
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -44,6 +45,16 @@ HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authoriza
 # so it is a timed breaker, never a permanent demotion.
 _FREE_EXHAUSTED: dict[str, float] = {}
 _FREE_COOLDOWN_S = float(os.environ.get("HELLO_OPERATOR_FREE_COOLDOWN_S", "900"))
+
+
+def _denied(spec, denylist) -> bool:
+    """True when an operator has banned this model. Matched as a case-insensitive
+    substring of the backend id so one entry covers every provider serving it."""
+    if not denylist:
+        return False
+    mid = str(getattr(spec, "id", "")).lower()
+    key = str(getattr(spec, "key", "")).lower()
+    return any(d.lower() in mid or d.lower() in key for d in denylist)
 
 
 def _is_free(spec) -> bool:
@@ -87,6 +98,8 @@ class Router:
         self.cfg = cfg
         self.affinity = AffinityMap(cfg.settings)
         self.decisions = DecisionLog(cfg.settings.decision_log)
+        self.last_served: Optional[dict] = None      # most recent, ANY session
+        self._served_by_session: dict[str, dict] = {}
         self.http: Optional[aiohttp.ClientSession] = None
         self.classifier: Optional[Classifier] = None
         self._sem: Optional[asyncio.Semaphore] = (
@@ -373,6 +386,69 @@ class Router:
             "sessions": len(self.affinity),
         })
 
+    def _cascade_head(self) -> Optional[ModelSpec]:
+        """First model the default role would try; what /v1/status shows before
+        any turn has been served."""
+        name = getattr(self.cfg.settings, "default_role", "") or ""
+        role = self.cfg.roles.get(name) if name else None
+        if role is None and self.cfg.roles:
+            role = next(iter(self.cfg.roles.values()))
+        if role is None:
+            return None
+        for key in (getattr(role, "cascade", None) or []):
+            spec = self.cfg.models.get(key)
+            if spec is not None:
+                return spec
+        return None
+
+    def status_payload(self, request: Optional[web.Request] = None) -> dict:
+        """Who is actually answering, for surfaces that can only show a config name.
+
+        ``active`` is THIS caller's session, identified by the same session header
+        the chat path uses. A caller that does not identify itself gets no
+        ``active`` at all and must read ``last_any``, which is honestly named:
+        with many cron sessions in flight, the most recent turn process-wide is
+        usually somebody else's.
+        """
+        logical = self.cfg.settings.logical_model
+        free_n = sum(1 for s in self.cfg.models.values() if _is_free(s))
+        out: dict = {
+            "status": "ok",
+            "router": logical,
+            "display": logical,
+            "active": None,
+            "models": {"free": free_n, "paid": len(self.cfg.models) - free_n,
+                       "total": len(self.cfg.models)},
+            "sessions": len(self.affinity),
+        }
+        head = self._cascade_head()
+        if head is not None:
+            out["cascade_head"] = {"key": head.key, "model": head.id,
+                                   "provider": _provider_name(head.endpoint, head),
+                                   "free": _is_free(head)}
+        def _decorate(rec):
+            if not rec:
+                return None
+            d = dict(rec)
+            d["age_s"] = round(max(0.0, time.time() - float(rec.get("at") or 0)), 1)
+            d["display"] = "HelloOperator/%s/%s" % (d.get("provider") or "unknown",
+                                                    d.get("model") or "unknown")
+            return d
+
+        out["last_any"] = _decorate(self.last_served)
+        sid = ""
+        if request is not None:
+            sid = request.headers.get(self.cfg.settings.session_header, "")
+        if sid:
+            active = _decorate(self._served_by_session.get("hdr:%s" % sid))
+            if active:
+                out["active"] = active
+                out["display"] = active["display"]
+        return out
+
+    async def handle_status(self, request: web.Request) -> web.Response:
+        return web.json_response(self.status_payload(request))
+
     async def handle_chat(self, request: web.Request) -> web.StreamResponse:
         t0 = time.monotonic()
         try:
@@ -454,6 +530,12 @@ class Router:
                               candidates, stream, buffered, routing_ms):
         last_error = "no candidates"
         for i, (spec, role, pos) in enumerate(candidates):
+            if _denied(spec, self.cfg.settings.denylist):
+                # Banned models are skipped before the request is built, so a
+                # denylist entry costs nothing and cannot be reached by failover,
+                # escalation or a pin.
+                last_error = f"{spec.key}: denylisted by operator"
+                continue
             if _is_free(spec) and free_exhausted(spec.endpoint):
                 last_error = f"{spec.key}: free tier on {spec.endpoint} exhausted"
                 continue
@@ -732,6 +814,30 @@ class Router:
 
     def _log_decision(self, st: Optional[SessionState], decision: Decision,
                       routing_ms: float, escalation_failures: list[str]) -> None:
+        if decision.spec is not None:
+            # Same choke point the decision log uses, so the status endpoint and
+            # the log can never disagree about who served.
+            rec = {
+                "key": decision.spec.key,
+                "model": decision.spec.id,
+                "provider": _provider_name(decision.spec.endpoint, decision.spec),
+                "endpoint": decision.spec.endpoint,
+                "free": _is_free(decision.spec),
+                "role": decision.role,
+                "pos": decision.pos,
+                "decision": decision.kind,
+                "at": round(time.time(), 3),
+            }
+            self.last_served = rec
+            if st is not None:
+                # Keyed per session: a reader asking "what am I on?" must not be
+                # answered with whichever cron turn happened to finish last.
+                self._served_by_session[st.key] = rec
+                if len(self._served_by_session) > _SERVED_CAP:
+                    stale = sorted(self._served_by_session.items(),
+                                   key=lambda kv: kv[1].get("at", 0))
+                    for k, _v in stale[:len(self._served_by_session) - _SERVED_CAP]:
+                        self._served_by_session.pop(k, None)
         self.decisions.write(
             session=st.key if st else "",
             role=decision.role,
@@ -750,6 +856,48 @@ class _RetryableStatus(Exception):
         self.status = status
 
 
+# Display surfaces (Telegram, the CLI) render the model from CONFIG, so while the
+# router is active they all read "hello-operator" and the backend that actually
+# answered -- the one that decides whether a turn is free or paid -- is invisible.
+# /v1/status reports it; these names make it readable.
+_SERVED_CAP = 512   # bound the per-session status store
+
+_PROVIDER_LABELS = {
+    "openrouter.ai": "openrouter",
+    "inference-api.nousresearch.com": "nousresearch",
+    "integrate.api.nvidia.com": "nvidia",
+    "model.inferx.net": "inferx",
+    "api.deepseek.com": "deepseek",
+}
+
+
+def _provider_name(endpoint: str, spec=None) -> str:
+    """Readable provider for a backend endpoint (never raises: display only).
+
+    A spec that already knows it is local wins: config.infer_location() handles
+    RFC-1918, link-local, .lan/.internal and an operator's declared value, and
+    re-deriving that from the URL string here would be strictly worse.
+    """
+    if spec is not None and str(getattr(spec, "location", "")).lower() == "local":
+        return "local"
+    try:
+        host = (urlparse(endpoint).hostname or "").lower()
+    except ValueError:
+        return "unknown"
+    if not host:
+        return "unknown"
+    if host in _PROVIDER_LABELS:
+        return _PROVIDER_LABELS[host]
+    if host in ("127.0.0.1", "localhost", "::1") or host.endswith(".local"):
+        return "local"
+    parts = [p for p in host.split(".") if p]
+    # A dotted-quad's second-to-last label is an octet: "192.168.1.50" would be
+    # reported as the provider "1". Show the host instead of a digit.
+    if len(parts) >= 2 and not parts[-2].isdigit():
+        return parts[-2]
+    return host
+
+
 ROUTER_KEY = web.AppKey("router", "Router")
 
 
@@ -762,4 +910,5 @@ def build_app(cfg: Config) -> web.Application:
     app.router.add_post("/v1/chat/completions", router.handle_chat)
     app.router.add_get("/v1/models", router.handle_models)
     app.router.add_get("/healthz", router.handle_health)
+    app.router.add_get("/v1/status", router.handle_status)
     return app

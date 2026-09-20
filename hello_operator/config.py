@@ -115,6 +115,7 @@ class Settings:
     context_safety_margin: int = 256
     repeat_call_threshold: int = 3
     refusal_markers: list[str] = field(default_factory=list)  # MAY; empty = off
+    denylist: list[str] = field(default_factory=list)  # operator-banned models
     refusal_escalate: bool = False        # advisory only unless explicitly enabled
     decision_log: str = ""                # path; empty disables (FR-11)
     state_dir: str = "~/.hello-operator"
@@ -246,6 +247,11 @@ def _parse_settings(raw_router: dict, raw_routing: dict) -> Settings:
             setattr(s, name, bool(raw_router[name]))
     if "refusal_markers" in raw_router:
         s.refusal_markers = [str(x) for x in (raw_router["refusal_markers"] or [])]
+    if "denylist" in raw_router:
+        # Matched as a case-insensitive substring of the BACKEND id, so one entry
+        # ("ling-3.0-flash-sante") bans that model on every provider serving it.
+        s.denylist = [str(x).strip().lower()
+                      for x in (raw_router["denylist"] or []) if str(x).strip()]
 
     if s.switch_cost not in ("low", "high"):
         raise ConfigError("router.switch_cost must be 'low' or 'high'")

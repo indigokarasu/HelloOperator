@@ -198,7 +198,15 @@ def apply_ranking(config_path: str, ranked: dict, raw_cfg: dict) -> tuple[bool, 
 
     free_keys: list[str] = []
     taken = set(models)
+    deny = [str(x).strip().lower()
+            for x in (((raw_cfg or {}).get("router") or {}).get("denylist") or [])
+            if str(x).strip()]
     for model_id, vs in sorted(variants.items(), key=lambda kv: _best(kv[1]), reverse=True):
+        if deny and any(d in model_id.lower() for d in deny):
+            # Without this the nightly re-ranking would quietly reinstate a model
+            # the operator banned, and the ban would last exactly one day.
+            log.info("ranking: %s is denylisted, skipping", model_id)
+            continue
         vs.sort(key=lambda ev: (-ev[1]["score"], -ev[1]["tok_s"],
                                 order.index(ev[0]) if ev[0] in order else 99))
         for endpoint, row in vs:
