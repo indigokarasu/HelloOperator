@@ -539,6 +539,15 @@ class Router:
                 # Pre-flight: refuse BEFORE spending. Post-hoc accounting cannot
                 # stop the single 131k-max_tokens call that empties the account,
                 # which is precisely how this budget came to exist.
+                _priced = (float(getattr(spec, "price_in", 0) or 0) > 0
+                           or float(getattr(spec, "price_out", 0) or 0) > 0)
+                if not _priced:
+                    # Unknown cost is not free cost. A paid model nobody priced is
+                    # exactly how an unbounded model reaches a budgeted fleet.
+                    last_error = ("%s: refused, no price declared and a budget is set"
+                                  % spec.key)
+                    log.warning("budget: %s", last_error)
+                    continue
                 _est = estimate_usd(spec, getattr(props, "est_tokens", 0),
                                     getattr(props, "max_tokens", 0))
                 if self.budget.would_exceed(_est):

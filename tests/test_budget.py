@@ -101,3 +101,40 @@ def test_no_budget_configured_keeps_the_old_behaviour(tmp_path):
     status, payload, _ = _ask(tmp_path, _cfg(tmp_path))
     assert status == 200
     assert payload["router"]["backend_model"] == "vendor/premium"
+
+# ----------------------------------------------------- unknown cost != free
+
+def _cfg_unpriced(tmp_path, **router):
+    """A paid model with NO declared price, deliberately first in the cascade."""
+    models = {
+        "mystery": {"id": "vendor/mystery-premium", "endpoint": "BACKEND",
+                    "capabilities": ["text", "tools", "json"], "context_window": 131072},
+        "free": {"id": "vendor/cheap:free", "endpoint": "BACKEND",
+                 "capabilities": ["text", "tools", "json"], "context_window": 131072},
+    }
+    roles = {"chat": {"cascade": ["mystery", "free"], "utterances": CHAT_UTTERANCES}}
+    return base_config(tmp_path, models=models, roles=roles, default_role="chat", **router)
+
+
+def _ask_unpriced(tmp_path, cfg):
+    async def scenario():
+        backend = FakeBackend({"vendor/mystery-premium": _echo("mystery"),
+                               "vendor/cheap:free": _echo("cheap")})
+        async with RouterEnv(tmp_path, cfg, backend) as env:
+            return await env.chat([{"role": "user", "content": "hello chat"}])
+    return run(scenario())
+
+
+def test_unpriced_paid_model_is_refused_under_a_budget(tmp_path):
+    """An unpriced model estimated $0.00 and sailed through the ceiling."""
+    status, payload, _ = _ask_unpriced(tmp_path, _cfg_unpriced(tmp_path, budget_daily_usd=1000))
+    assert status == 200
+    assert payload["router"]["backend_model"] == "vendor/cheap:free", \
+        "an unpriced paid model was used despite a budget being set"
+
+
+def test_unpriced_paid_model_is_allowed_when_no_budget_is_set(tmp_path):
+    """Control: the refusal is the budget, not a blanket ban on unpriced models."""
+    status, payload, _ = _ask_unpriced(tmp_path, _cfg_unpriced(tmp_path))
+    assert status == 200
+    assert payload["router"]["backend_model"] == "vendor/mystery-premium"
