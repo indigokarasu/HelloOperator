@@ -386,3 +386,32 @@ def test_streamed_turn_books_the_reported_cost(tmp_path):
     assert abs(spent - REPORTED) < 1e-9, (
         f"streamed turn booked ${spent:.6f}; backend reported ${REPORTED:.6f} "
         f"(worst-case estimate was ${estimate:.6f})")
+
+
+def test_budget_exhaustion_still_tries_free(tmp_path):
+    """A spent budget must not take the free tier down with it.
+
+    Live symptom: "no backend could serve the request; last error:
+    or-deepseek-v41-flash: refused, est $0.0090 exceeds the $0.0000 remaining"
+    -- a hard 502 while a free model sat right there in the cascade.
+    """
+    models = {
+        "paid": {"id": "vendor/premium", "endpoint": "BACKEND",
+                 "capabilities": ["text", "tools", "json"], "context_window": 131072,
+                 "price_in": 10.0, "price_out": 50.0},
+        "free": {"id": "vendor/cheap:free", "endpoint": "BACKEND",
+                 "capabilities": ["text", "tools", "json"], "context_window": 131072},
+    }
+    roles = {"chat": {"cascade": ["paid", "free"], "utterances": CHAT_UTTERANCES}}
+    cfg = base_config(tmp_path, models=models, roles=roles, default_role="chat",
+                      budget_daily_usd=0.0000001)
+
+    async def scenario():
+        backend = FakeBackend({"vendor/premium": _echo("premium"),
+                               "vendor/cheap:free": _echo("cheap")})
+        async with RouterEnv(tmp_path, cfg, backend) as env:
+            return await env.chat([{"role": "user", "content": "hello chat"}],
+                                  max_tokens=131072)
+    status, payload, _ = run(scenario())
+    assert status == 200, f"budget exhaustion produced {status}, not a free answer"
+    assert payload["router"]["backend_model"] == "vendor/cheap:free"

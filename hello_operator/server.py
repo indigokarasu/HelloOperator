@@ -592,6 +592,34 @@ class Router:
                 if e.status in (402, 429) and _is_free(spec):
                     mark_free_exhausted(spec.endpoint)
                 continue
+        # Last resort: everything was skipped or failed, and we are about to
+        # fail the turn outright. A free model costs nothing to attempt, so a
+        # certain 502 is strictly worse than one more try at a backend whose
+        # only disqualification was a cooldown or a spent budget. This cannot
+        # spend money: paid specs are excluded, not merely deprioritized.
+        retried = False
+        for spec, role, pos in candidates:
+            if not _is_free(spec) or _denied(spec, self.cfg.settings.denylist):
+                continue
+            retried = True
+            decision = Decision(spec=spec, role=role, pos=pos,
+                                kind="last-resort", trigger="all-candidates-failed")
+            log.warning("last resort: retrying free '%s' despite cooldown, "
+                        "because the alternative is failing the turn (%s)",
+                        spec.key, last_error)
+            try:
+                if stream and not buffered:
+                    return await self._forward_stream(request, body, props,
+                                                      decision, st, routing_ms)
+                return await self._forward_buffered(request, body, props, decision,
+                                                    st, routing_ms, emit_stream=stream)
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError,
+                    _RetryableStatus) as e:
+                last_error = f"{spec.key}: {e.__class__.__name__}: {e}"
+                continue
+        if retried:
+            last_error += " (free backends retried as a last resort and still failed)"
+
         # FR-9: never silently fail without naming what went wrong.
         return _err(502, f"no backend could serve the request; last error: {last_error}",
                     "backends_unavailable")
