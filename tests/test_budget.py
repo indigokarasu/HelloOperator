@@ -387,14 +387,18 @@ def test_streamed_turn_books_the_reported_cost(tmp_path):
         f"streamed turn booked ${spent:.6f}; backend reported ${REPORTED:.6f} "
         f"(worst-case estimate was ${estimate:.6f})")
 
-
 def test_budget_exhaustion_still_tries_free(tmp_path):
     """A spent budget must not take the free tier down with it.
 
-    Live symptom: "no backend could serve the request; last error:
-    or-deepseek-v41-flash: refused, est $0.0090 exceeds the $0.0000 remaining"
-    -- a hard 502 while a free model sat right there in the cascade.
+    Both disqualifications at once -- free models inside their 429 cooldown,
+    paid models refused by the daily ceiling -- is the live failure:
+    "no backend could serve the request; last error: or-deepseek-v41-flash:
+    refused, est $0.0090 exceeds the $0.0000 remaining". The cooldown has to be
+    tripped here or the normal loop serves the free model and the last-resort
+    pass is never reached, which would make this test pass vacuously.
     """
+    from hello_operator import server as server_mod
+
     models = {
         "paid": {"id": "vendor/premium", "endpoint": "BACKEND",
                  "capabilities": ["text", "tools", "json"], "context_window": 131072,
@@ -410,8 +414,18 @@ def test_budget_exhaustion_still_tries_free(tmp_path):
         backend = FakeBackend({"vendor/premium": _echo("premium"),
                                "vendor/cheap:free": _echo("cheap")})
         async with RouterEnv(tmp_path, cfg, backend) as env:
+            # put the free endpoint into its exhausted cooldown, as a 429 would
+            server_mod.mark_free_exhausted(env.backend_base)
             return await env.chat([{"role": "user", "content": "hello chat"}],
-                                  max_tokens=131072)
-    status, payload, _ = run(scenario())
-    assert status == 200, f"budget exhaustion produced {status}, not a free answer"
+                                  max_tokens=1024)
+    try:
+        status, payload, _ = run(scenario())
+    finally:
+        server_mod._FREE_EXHAUSTED.clear()   # never leak state into other tests
+
+    assert status == 200, (
+        f"budget exhausted + free in cooldown produced {status}; "
+        f"a free retry costs nothing and beats failing the turn")
     assert payload["router"]["backend_model"] == "vendor/cheap:free"
+    assert payload["router"]["decision"] == "last-resort", \
+        "served, but not via the last-resort path this test exists to cover"

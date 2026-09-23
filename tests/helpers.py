@@ -193,6 +193,7 @@ class RouterEnv:
 
     async def __aenter__(self) -> "RouterEnv":
         backend_base = await self.backend.start()
+        self.backend_base = backend_base   # tests that need the endpoint key
         text = yaml.safe_dump(self.config_dict).replace("BACKEND", backend_base)
         cfg_path = self.tmp_path / "config.yaml"
         cfg_path.write_text(text)
