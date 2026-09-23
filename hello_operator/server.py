@@ -778,6 +778,13 @@ class Router:
                 "stream-abort" if aborted else "tool-validation")
             log.info("streamed turn failed; escalation armed for next turn "
                      "(FR-8): %s", "; ".join(failures))
+        # Charge what the backend actually billed. Without this the streamed
+        # path produced no cost signal at all, so _log_decision fell back to the
+        # worst-case max_tokens estimate -- and Hermes streams every turn, so
+        # the ceiling filled with spend that never happened ($1.48 booked
+        # against $0.55 billed) and then refused real work for the rest of the day.
+        if collector.usage:
+            decision.actual_usd = response_cost({"usage": collector.usage}, spec)
         self._log_decision(st, decision, routing_ms, escalation_failures=failures)
         return resp
 

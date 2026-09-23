@@ -352,3 +352,37 @@ def test_ledger_books_the_reported_cost_not_the_estimate(tmp_path):
     assert abs(spent - REPORTED) < 1e-9, (
         f"ledger booked ${spent:.6f}; the backend reported ${REPORTED:.6f} "
         f"(pre-flight estimate was ${estimate:.6f})")
+
+
+def test_streamed_turn_books_the_reported_cost(tmp_path):
+    """Hermes streams every turn, so this is the path that matters.
+
+    With no cost signal the ledger falls back to the worst-case max_tokens
+    estimate. Live, that booked $1.48 against $0.55 actually billed and then
+    refused every request for the rest of the UTC day with
+    "est $0.0090 exceeds the $0.0000 remaining".
+    """
+    REPORTED = 0.000012
+
+    def priced(body, idx):
+        return {"content": "answer",
+                "usage": {"prompt_tokens": 2000, "completion_tokens": 40,
+                          "total_tokens": 2040, "cost": REPORTED}}
+
+    cfg = _cost_cfg(tmp_path, budget_daily_usd=10_000)
+
+    async def scenario():
+        backend = FakeBackend({"vendor/premium": priced})
+        async with RouterEnv(tmp_path, cfg, backend) as env:
+            return await env.chat([{"role": "user", "content": "hello chat"}],
+                                  stream=True, max_tokens=8192)
+    status, payload, _ = run(scenario())
+    assert status == 200
+
+    ledger = json.loads((tmp_path / "state" / "budget.json").read_text())
+    spent = ledger["spent_usd"]
+    estimate = estimate_usd(_Spec(10.0, 50.0), 2000, 8192)
+    assert estimate > REPORTED * 100, "test is meaningless unless the two differ"
+    assert abs(spent - REPORTED) < 1e-9, (
+        f"streamed turn booked ${spent:.6f}; backend reported ${REPORTED:.6f} "
+        f"(worst-case estimate was ${estimate:.6f})")

@@ -94,6 +94,7 @@ class StreamCollector:
         self.tool_calls: dict[int, dict] = {}
         self.finish_reason: Optional[str] = None
         self.model: str = ""
+        self.usage: dict = {}
         self._buf = b""
 
     def feed(self, chunk: bytes) -> None:
@@ -113,6 +114,13 @@ class StreamCollector:
         except ValueError:
             return
         self.model = obj.get("model") or self.model
+        # The final chunk carries settled token counts and, on OpenRouter, the
+        # real cost. It is the ONLY truthful cost signal a streamed turn ever
+        # produces, and it rides a chunk whose `choices` list is empty -- so it
+        # has to be read here, not from the assembled message.
+        _u = obj.get("usage")
+        if isinstance(_u, dict) and _u:
+            self.usage = _u
         for choice in obj.get("choices") or []:
             # Routing validation concerns the primary choice only; collecting
             # every choice index interleaves contents and concatenates

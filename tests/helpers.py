@@ -104,6 +104,12 @@ class FakeBackend:
             done = {"id": "cc1", "object": "chat.completion.chunk", "model": model,
                     "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]}
             await resp.write(b"data: " + json.dumps(done).encode() + b"\n\n")
+            if spec.get("usage"):
+                # Real backends send a final usage-only chunk; the router's one
+                # chance to learn what a streamed turn actually cost.
+                tail = {"id": "cc1", "object": "chat.completion.chunk",
+                        "model": model, "choices": [], "usage": spec["usage"]}
+                await resp.write(b"data: " + json.dumps(tail).encode() + b"\n\n")
             await resp.write(b"data: [DONE]\n\n")
             await resp.write_eof()
             return resp
