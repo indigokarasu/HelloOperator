@@ -880,7 +880,16 @@ class Router:
                 st.pending_escalation = ""
         st.role = decision.role or st.role
         st.model_key = decision.spec.key if decision.spec else st.model_key
-        st.pos = decision.pos
+        # A PAID pick must not become the session's sticky position. Affinity
+        # holds a session wherever it last landed, and the idle timeout only
+        # counts *idle* time -- so a single escalation (one backend hiccup, one
+        # oversized request) pins every later turn of an active session onto
+        # the paid tail. Measured 2026-09-22: 787 of 860 paid calls were
+        # affinity reuses, and they drained the daily budget by mid-morning,
+        # after which the budget refused real work and cron jobs failed 502.
+        # Park the session back at the top of its cascade: if the free block
+        # still cannot serve it, the next turn escalates again on its own.
+        st.pos = decision.pos if (decision.spec is None or _is_free(decision.spec)) else 0
         st.tools_sig = props.tools_sig
         st.est_tokens = props.est_tokens
         st.msg_count = props.msg_count
