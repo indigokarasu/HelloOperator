@@ -356,6 +356,19 @@ class Router:
         out["model"] = spec.id
         out.pop("session_id", None)  # router convention, not an OpenAI field
 
+        # A streamed OpenAI-compatible response carries NO usage block unless the
+        # caller asks for one. Without this, StreamCollector.usage is always empty,
+        # so the streamed path has no cost signal and _log_decision falls back to
+        # the worst-case max_tokens estimate. Hermes streams every turn, so the
+        # ceiling filled with spend that was never billed and then refused real
+        # work: 3,405 budget refusals in one day, with cron jobs failing on 502.
+        # Only for PAID backends -- a free model's cost is 0 either way, and not
+        # every free endpoint tolerates the extra parameter.
+        if out.get("stream") and not _is_free(spec):
+            opts = dict(out.get("stream_options") or {})
+            opts["include_usage"] = True
+            out["stream_options"] = opts
+
         # Backends disagree about the OpenAI schema, and a rejected parameter is
         # indistinguishable from a dead model to everything upstream: Hermes sent
         # reasoning_effort="medium" and DeepSeek V4.1 answered HTTP 400 ("must be
