@@ -148,6 +148,12 @@ class Router:
                         reasons: list[str]) -> dict[str, list[int]]:
         out = {}
         for role in self.cfg.roles.values():
+            # A role that requires vision cannot help a request with no image. The classifier
+            # ranks roles on wording alone, so text about icons or pictures could otherwise land
+            # on a vision-only cascade (a vision model answering a text turn with bounding boxes).
+            if "vision" in role.requires and not props.has_image:
+                reasons.append(f"role '{role.name}' requires vision but the request has no image")
+                continue
             positions = self._role_capable_positions(role, props, reasons)
             if positions:
                 out[role.name] = positions

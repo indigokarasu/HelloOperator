@@ -165,6 +165,36 @@ def test_vision_request_excludes_text_only_models(tmp_path):
     run(scenario())
 
 
+
+def test_text_request_never_routes_to_vision_only_role(tmp_path):
+    """Wording that resembles a vision utterance must not send a text-only turn to a
+    vision-only cascade; an actual image still may."""
+    vision_texts = ["describe this screenshot", "what's in this image?"]
+    models = {
+        "fast": {"id": "fast-model", "endpoint": "BACKEND",
+                 "capabilities": ["text", "tools", "json"], "context_window": 32768},
+        "eye": {"id": "eye-model", "endpoint": "BACKEND",
+                "capabilities": ["text", "vision"], "context_window": 32768},
+    }
+    roles = {
+        "chat": {"cascade": ["fast"], "utterances": CHAT_UTTERANCES},
+        "vision": {"cascade": ["eye"], "requires": ["vision"], "utterances": vision_texts},
+    }
+    cfg = base_config(tmp_path, models=models, roles=roles, default_role="chat")
+
+    async def scenario():
+        backend = FakeBackend({"fast-model": _echo("fast"), "eye-model": _echo("eye")})
+        async with RouterEnv(tmp_path, cfg, backend) as env:
+            _, _, h = await env.chat([{"role": "user", "content": "describe this screenshot"}],
+                                     session="t1")
+            assert h["x-router-model"] == "fast"
+            assert h["x-router-role"] == "chat"
+            _, _, h = await env.chat([{"role": "user", "content": [
+                {"type": "text", "text": "describe this screenshot"},
+                {"type": "image_url", "image_url": {"url": "u"}}]}], session="t2")
+            assert h["x-router-model"] == "eye"
+    run(scenario())
+
 # ------------------------------------------------------------- escalation
 
 def esc_cfg(tmp_path, **router_extra):
