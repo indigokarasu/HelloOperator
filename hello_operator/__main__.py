@@ -72,7 +72,8 @@ async def _rank_free(cfg: Config, apply: bool) -> int:
     """Rediscover + re-rank each provider's free models (owner directive).
 
     Keys come from the already-resolved model specs, so a provider is probed
-    with exactly the credential the router would use at request time.
+    with exactly the credentials the router would use at request time (its whole
+    router.key_pools rotation, when it has one).
     """
     import yaml as _yaml
 
@@ -81,7 +82,7 @@ async def _rank_free(cfg: Config, apply: bool) -> int:
     keys = {}
     for spec in cfg.models.values():
         if getattr(spec, "api_key", None):
-            keys.setdefault(spec.endpoint, spec.api_key)
+            keys.setdefault(spec.endpoint, list(spec.api_keys) or [spec.api_key])
     if not ranking.settings(raw).get("provider_order"):
         print("ranking.provider_order is empty — nothing to rank")
         return 0

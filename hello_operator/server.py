@@ -16,6 +16,7 @@ import logging
 import time
 import uuid
 from urllib.parse import urlparse
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -39,11 +40,11 @@ HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authoriza
 
 
 # --- provider-wide free-tier breaker -------------------------------------
-# Free tiers are exhausted PER PROVIDER, not per model: when one free model
-# answers 402/429, its siblings on the same endpoint almost always answer the
-# same way (owner observation, 2026-09-19). Without this, a capped provider
-# costs one wasted round-trip per free model on every request. Not always true,
-# so it is a timed breaker, never a permanent demotion.
+# Free tiers are exhausted PER PROVIDER ACCOUNT, not per model: when one free
+# model answers 402/429, its siblings on the same endpoint and key almost always
+# answer the same way (owner observation, 2026-09-19). Without this, a capped
+# provider costs one wasted round-trip per free model on every request. Not
+# always true, so it is a timed breaker, never a permanent demotion.
 _FREE_EXHAUSTED: dict[str, float] = {}
 _FREE_COOLDOWN_S = float(os.environ.get("HELLO_OPERATOR_FREE_COOLDOWN_S", "900"))
 
@@ -69,6 +70,89 @@ def _shares_free_quota(spec) -> bool:
     provider-wide breaker tracks. Stealth models have their own limits: a spent free tier
     must not take them out of rotation, and their 429s must not trip it."""
     return str(getattr(spec, "id", "")).endswith(":free")
+
+
+def quota_key(endpoint: str, key: str = "") -> str:
+    """Whose quota a call draws on: the endpoint, plus the account when a key is
+    sent. Two OpenRouter accounts are two quotas; one account running dry must
+    not take the other's models out of rotation. Keys appear only as a hash."""
+    if not key:
+        return endpoint
+    return f"{endpoint}#{hashlib.sha256(key.encode()).hexdigest()[:10]}"
+
+
+# --- key rotation (router.key_pools, owner directive 2026-09-25) -----------
+# One endpoint, several accounts' keys. Each call to a model starts on the next
+# key in turn, spreading the per-account rate limits, and a key the provider
+# refuses is set aside for a while and the SAME model is retried on the next
+# key before the cascade moves on: another account is a better fallback than a
+# worse model. Single-key models behave exactly as before (only the free-tier
+# breaker above applies to them).
+_KEY_NEXT: dict[str, int] = {}
+_KEY_COOLDOWN: dict[tuple[str, str], float] = {}     # (quota_key, scope) -> until
+_KEY_COOLDOWN_S = {401: 600.0, 403: 600.0, 402: 900.0, 429: 60.0}
+_ROTATE_ON = (401, 402, 403, 429)
+
+
+def _key_scopes(spec) -> tuple[str, ...]:
+    """The cooldown scopes a call to ``spec`` is subject to."""
+    return ("*", "paid" if not _is_free(spec) else "free", f"model:{spec.id}")
+
+
+def _refusal_scope(spec, status: int) -> str:
+    """How far a refusal reaches. 401/403: the key itself is bad. 402 on a free
+    model: the account is blocked outright (a negative balance stops free models
+    too); on a paid model: only its paid calls. 429: that model, except ':free'
+    ids, whose shared free quota the breaker above tracks."""
+    if status in (401, 403) or (status == 402 and _is_free(spec)):
+        return "*"
+    if status == 402:
+        return "paid"
+    return f"model:{spec.id}"
+
+
+def key_cooling(spec, key: str) -> bool:
+    now = time.monotonic()
+    qk = quota_key(spec.endpoint, key)
+    if _shares_free_quota(spec) and free_exhausted(qk):
+        return True
+    return any(_KEY_COOLDOWN.get((qk, s), 0.0) > now for s in _key_scopes(spec))
+
+
+def set_key_aside(spec, key: str, status: int) -> None:
+    qk = quota_key(spec.endpoint, key)
+    if status in (402, 429) and _shares_free_quota(spec):
+        mark_free_exhausted(qk)
+    if len(getattr(spec, "api_keys", None) or []) > 1 and status in _ROTATE_ON:
+        scope = _refusal_scope(spec, status)
+        _KEY_COOLDOWN[(qk, scope)] = time.monotonic() + _KEY_COOLDOWN_S[status]
+        log.warning("%s: key %d/%d answered %s; set aside (%s) for %.0fs",
+                    spec.key, key_slot(spec, key), len(spec.api_keys), status, scope,
+                    _KEY_COOLDOWN_S[status])
+
+
+def key_slot(spec, key: str) -> int:
+    """1-based position of ``key`` in the model's pool (0 when it has none): the
+    only way a key is identified in logs and /v1/status."""
+    pool = list(getattr(spec, "api_keys", None) or [])
+    return pool.index(key) + 1 if key in pool else 0
+
+
+def keys_in_turn(spec, skip_cooling: bool = True) -> list[str]:
+    """The keys to try for one call, in order. Rotates the starting key per call
+    so load spreads across accounts; keys in a cooldown are left out."""
+    pool = list(getattr(spec, "api_keys", None) or []) or [spec.api_key]
+    if len(pool) > 1:
+        start = _KEY_NEXT.get(spec.endpoint, 0) % len(pool)
+        _KEY_NEXT[spec.endpoint] = start + 1
+        pool = pool[start:] + pool[:start]
+    if not skip_cooling:
+        return pool
+    return [k for k in pool if not key_cooling(spec, k)]
+
+
+def _with_key(spec, key: str):
+    return spec if key == spec.api_key else dataclasses.replace(spec, api_key=key)
 
 
 def free_exhausted(endpoint: str) -> bool:
@@ -98,6 +182,7 @@ class Decision:
     error_status: int = 0
     error_message: str = ""
     reasons: list[str] = field(default_factory=list)
+    key_slot: int = 0        # which key of the model's pool served (0: no pool)
 
 
 def _err(status: int, message: str, code: str = "router_error") -> web.Response:
@@ -650,30 +735,43 @@ class Router:
                 # escalation or a pin.
                 last_error = f"{spec.key}: denylisted by operator"
                 continue
-            if _shares_free_quota(spec) and free_exhausted(spec.endpoint):
-                last_error = f"{spec.key}: free tier on {spec.endpoint} exhausted"
+            keys = keys_in_turn(spec)
+            if not keys:
+                last_error = (f"{spec.key}: free tier on {spec.endpoint} exhausted"
+                              if len(spec.api_keys) <= 1 else
+                              f"{spec.key}: every key for {spec.endpoint} is set aside")
                 continue
-            if i > 0:
-                decision = Decision(spec=spec, role=role, pos=pos,
-                                    kind="failover", trigger="backend-unreachable")
-                log.warning("failing over to '%s' (%s)", spec.key, last_error)
-            try:
-                if stream and not buffered:
-                    return await self._forward_stream(request, body, props,
-                                                      decision, st, routing_ms)
-                return await self._forward_buffered(request, body, props, decision,
-                                                    st, routing_ms,
-                                                    emit_stream=stream)
-            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
-                # Safe to try the next candidate: _forward_stream never raises
-                # once bytes have been written to the client (FR-8 commit).
-                last_error = f"{spec.key}: {e.__class__.__name__}: {e}"
-                continue
-            except _RetryableStatus as e:
-                last_error = f"{spec.key}: backend returned {e.status}"
-                if e.status in (402, 429) and _shares_free_quota(spec):
-                    mark_free_exhausted(spec.endpoint)
-                continue
+            for n, key in enumerate(keys):
+                kspec = _with_key(spec, key)
+                if i > 0 or n > 0:
+                    decision = Decision(spec=kspec, role=role, pos=pos, kind="failover",
+                                        trigger="key-rotation" if n else "backend-unreachable")
+                    if n:
+                        log.warning("retrying '%s' on key %d/%d (%s)", spec.key,
+                                    key_slot(spec, key), len(spec.api_keys), last_error)
+                    else:
+                        log.warning("failing over to '%s' (%s)", spec.key, last_error)
+                else:
+                    decision.spec = kspec
+                decision.key_slot = key_slot(spec, key)
+                try:
+                    if stream and not buffered:
+                        return await self._forward_stream(request, body, props,
+                                                          decision, st, routing_ms)
+                    return await self._forward_buffered(request, body, props, decision,
+                                                        st, routing_ms,
+                                                        emit_stream=stream)
+                except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+                    # Safe to try the next candidate: _forward_stream never raises
+                    # once bytes have been written to the client (FR-8 commit).
+                    # The provider is unreachable, so another key would not help.
+                    last_error = f"{spec.key}: {e.__class__.__name__}: {e}"
+                    break
+                except _RetryableStatus as e:
+                    last_error = f"{spec.key}: backend returned {e.status}"
+                    set_key_aside(spec, key, e.status)
+                    if e.status not in _ROTATE_ON:
+                        break
         # Last resort: everything was skipped or failed, and we are about to
         # fail the turn outright. A free model costs nothing to attempt, so a
         # certain 502 is strictly worse than one more try at a backend whose
@@ -683,22 +781,24 @@ class Router:
         for spec, role, pos in candidates:
             if not _is_free(spec) or _denied(spec, self.cfg.settings.denylist):
                 continue
-            retried = True
-            decision = Decision(spec=spec, role=role, pos=pos,
-                                kind="last-resort", trigger="all-candidates-failed")
-            log.warning("last resort: retrying free '%s' despite cooldown, "
-                        "because the alternative is failing the turn (%s)",
-                        spec.key, last_error)
-            try:
-                if stream and not buffered:
-                    return await self._forward_stream(request, body, props,
-                                                      decision, st, routing_ms)
-                return await self._forward_buffered(request, body, props, decision,
-                                                    st, routing_ms, emit_stream=stream)
-            except (aiohttp.ClientError, asyncio.TimeoutError, OSError,
-                    _RetryableStatus) as e:
-                last_error = f"{spec.key}: {e.__class__.__name__}: {e}"
-                continue
+            for key in keys_in_turn(spec, skip_cooling=False):
+                retried = True
+                decision = Decision(spec=_with_key(spec, key), role=role, pos=pos,
+                                    kind="last-resort", trigger="all-candidates-failed",
+                                    key_slot=key_slot(spec, key))
+                log.warning("last resort: retrying free '%s' despite cooldown, "
+                            "because the alternative is failing the turn (%s)",
+                            spec.key, last_error)
+                try:
+                    if stream and not buffered:
+                        return await self._forward_stream(request, body, props,
+                                                          decision, st, routing_ms)
+                    return await self._forward_buffered(request, body, props, decision,
+                                                        st, routing_ms, emit_stream=stream)
+                except (aiohttp.ClientError, asyncio.TimeoutError, OSError,
+                        _RetryableStatus) as e:
+                    last_error = f"{spec.key}: {e.__class__.__name__}: {e}"
+                    continue
         if retried:
             last_error += " (free backends retried as a last resort and still failed)"
 
@@ -1043,6 +1143,8 @@ class Router:
                 "decision": decision.kind,
                 "at": round(time.time(), 3),
             }
+            if decision.key_slot:
+                rec["key_slot"] = decision.key_slot
             self.last_served = rec
             if st is not None:
                 # Keyed per session: a reader asking "what am I on?" must not be
@@ -1063,6 +1165,7 @@ class Router:
             trigger=decision.trigger,
             routing_latency_ms=routing_ms,
             validation_failures=escalation_failures or None,
+            **({"key_slot": decision.key_slot} if decision.key_slot else {}),
         )
 
 

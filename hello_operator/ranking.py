@@ -255,9 +255,10 @@ async def rank(http: aiohttp.ClientSession, raw_cfg: dict, keys: dict,
         log.info("ranking: JEV off (no ranking.jev api_key); judging by rules")
     out: dict[str, list[dict]] = {}
     for endpoint in s["provider_order"]:
-        api_key = keys.get(endpoint, "")
+        pool = keys.get(endpoint) or [""]
+        pool = [pool] if isinstance(pool, str) else list(pool)
         rows = []
-        entries = _candidates(await _catalogue(http, endpoint, api_key), s)
+        entries = _candidates(await _catalogue(http, endpoint, pool[0]), s)
         verdicts, counts = ({}, {}) if not js["enabled"] else \
             await jev.judge(http, entries, js, cache)
         picked, by_rules = [], 0
@@ -275,7 +276,13 @@ async def rank(http: aiohttp.ClientSession, raw_cfg: dict, keys: dict,
                  counts.get("failed", 0), counts.get("skipped", 0), by_rules, len(picked))
         for entry, d in picked:
             mid = str(entry.get("id"))
-            measured = await _probe(http, endpoint, api_key, mid, s)
+            # With a key pool, a model one account cannot reach (rate cap, spent
+            # quota) is probed on the next account before it counts as unprobeable.
+            measured, api_key = None, pool[0]
+            for api_key in pool:
+                measured = await _probe(http, endpoint, api_key, mid, s)
+                if measured is not None:
+                    break
             if measured is None:
                 continue
             score, tok_s, latency = measured

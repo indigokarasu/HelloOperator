@@ -103,3 +103,12 @@ routing:
 #     requirement: >-
 #       The model accepts text input, alone or with other media, and produces
 #       text output, alone or with other media.
+
+# ---------------------------------------------------------------- key pools
+# Several accounts for one provider: calls rotate across the keys, and a key the
+# provider refuses (401/402/403/429) is set aside while the same model is retried
+# on the next one. Name environment variables only; keep the values in the
+# service's environment, never in this file.
+# router:
+#   key_pools:
+#     https://openrouter.ai/api/v1: [${OPENROUTER_API_KEY}, ${OPENROUTER_API_KEY_2}]
