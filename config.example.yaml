@@ -87,3 +87,16 @@ roles:
 
 routing:
   default_role: chat
+
+# ------------------------------------------------------------------- ranking
+# `hello-operator --rank-free [--apply]` rediscovers each hosted provider's free
+# models, probes them, and rewrites the free half of every non-vision cascade.
+# ranking:
+#   provider_order: [https://openrouter.ai/api/v1]
+#   min_context: 262144
+#   jev:                          # TypeSafe JEV judges each catalogue entry:
+#     api_key: ${JEVER_API_KEY}   #   is it free? does it meet the requirement?
+#     threshold: 0.5              # without a key, fixed rules judge instead
+#     requirement: >-
+#       The model accepts text input, alone or with other media, and produces
+#       text output, alone or with other media.

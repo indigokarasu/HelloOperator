@@ -6,8 +6,10 @@ at cascade position 2, burning a hop on every request). So the free half of each
 cascade is REDISCOVERED and RE-RANKED on a schedule rather than hand-maintained.
 
 Per provider, in the configured provider order:
-  1. discover  -- the provider's own catalogue, filtered to free ids that meet
-     the context floor and (optionally) advertise tool support
+  1. discover  -- the provider's own catalogue, filtered to entries that meet
+     the context floor and (optionally) advertise tool support; JEV then judges
+     from each entry's attributes whether it is free and meets the requirement
+     (text or multimodal in, text or multimodal out), see jev.py
   2. measure   -- a small deterministic probe suite; correctness is checkable
      offline, so a model that answers 200 with empty or wrong content ranks
      below one that works, instead of silently sitting at position 1
@@ -31,6 +33,8 @@ from typing import Any, Optional
 
 import aiohttp
 import yaml
+
+from . import jev
 
 log = logging.getLogger("router.ranking")
 
@@ -219,24 +223,58 @@ async def _probe_tools(http: aiohttp.ClientSession, endpoint: str, api_key: str,
     return 2 if ("18" in text or "rain" in text.lower()) else 1
 
 
-async def rank(http: aiohttp.ClientSession, raw_cfg: dict, keys: dict) -> dict:
+def _candidates(entries: list[dict], s: dict) -> list[dict]:
+    """The numeric filters, applied before JEV so it is only asked about models
+    that could be ranked at all."""
+    out = []
+    for entry in entries:
+        mid = str(entry.get("id") or "")
+        if not mid or mid.startswith("openrouter/"):
+            continue    # meta-routers choose a backend per call; not a model to rank
+        if _ctx(entry) < int(s["min_context"]):
+            continue
+        if s["require_tools"] and "tools" not in (entry.get("supported_parameters") or []):
+            # Nous does not publish supported_parameters; probe decides instead.
+            if entry.get("supported_parameters") is not None:
+                continue
+        out.append(entry)
+    return out
+
+
+async def rank(http: aiohttp.ClientSession, raw_cfg: dict, keys: dict,
+               jev_cache_path: Optional[str] = None) -> dict:
     """Rank the free models of every configured provider. Returns
-    {endpoint: [ {id, score, tok_s, latency, context}, ... ]} best first."""
+    {endpoint: [ {id, score, tok_s, latency, context}, ... ]} best first.
+
+    Whether a model is free and meets the requirement is JEV's call (see jev.py);
+    the old rules judge only the entries JEV could not answer for."""
     s = settings(raw_cfg)
+    js = jev.settings(raw_cfg)
+    cache = jev.cache_load(jev_cache_path) if js["enabled"] else {}
+    if not js["enabled"]:
+        log.info("ranking: JEV off (no ranking.jev api_key); judging by rules")
     out: dict[str, list[dict]] = {}
     for endpoint in s["provider_order"]:
         api_key = keys.get(endpoint, "")
         rows = []
-        for entry in await _catalogue(http, endpoint, api_key):
-            mid = str(entry.get("id") or "")
-            if not is_free_entry(entry):
-                continue
-            if _ctx(entry) < int(s["min_context"]):
-                continue
-            if s["require_tools"] and "tools" not in (entry.get("supported_parameters") or []):
-                # Nous does not publish supported_parameters; probe decides instead.
-                if entry.get("supported_parameters") is not None:
-                    continue
+        entries = _candidates(await _catalogue(http, endpoint, api_key), s)
+        verdicts, counts = ({}, {}) if not js["enabled"] else \
+            await jev.judge(http, entries, js, cache)
+        picked, by_rules = [], 0
+        for entry in entries:
+            mid = str(entry.get("id"))
+            d = jev.decide(entry, verdicts.get(mid), js, is_free_entry(entry))
+            if d["note"]:
+                log.warning("ranking: %s: %s", mid, d["note"])
+            by_rules += d["by"] == "rules"
+            if d["free"] and d["meets"]:
+                picked.append((entry, d))
+        log.info("ranking: %s -> %d candidate(s); JEV asked %d, cached %d, failed %d, "
+                 "skipped %d; %d judged by rules; %d free and meeting the requirement",
+                 endpoint, len(entries), counts.get("asked", 0), counts.get("cached", 0),
+                 counts.get("failed", 0), counts.get("skipped", 0), by_rules, len(picked))
+        for entry, d in picked:
+            mid = str(entry.get("id"))
             measured = await _probe(http, endpoint, api_key, mid, s)
             if measured is None:
                 continue
@@ -247,12 +285,15 @@ async def rank(http: aiohttp.ClientSession, raw_cfg: dict, keys: dict) -> dict:
                 continue
             rows.append({"id": mid, "score": score, "tok_s": round(tok_s, 1),
                          "latency": round(latency, 2), "context": _ctx(entry),
-                         "tools": tools, "zero_priced": not mid.endswith(":free")})
+                         "tools": tools, "zero_priced": not mid.endswith(":free"),
+                         "vision": bool(d["vision"]), "judged_by": d["by"]})
         # Tool ability outranks everything: for an agent it is the capability the
         # others are useless without.
         rows.sort(key=lambda r: (-r.get("tools", 0), -r["score"], -r["tok_s"], -r["context"]))
         out[endpoint] = rows
         log.info("ranking: %s -> %d usable free model(s)", endpoint, len(rows))
+    if js["enabled"]:
+        jev.cache_save(jev_cache_path, cache, js)
     return out
 
 
@@ -318,7 +359,8 @@ def apply_ranking(config_path: str, ranked: dict, raw_cfg: dict) -> tuple[bool, 
                 template = next((v for k, v in models.items()
                                  if isinstance(v, dict) and v.get("endpoint") == endpoint), {})
                 models[key] = {"id": model_id, "endpoint": endpoint,
-                               "capabilities": ["text", "tools"],
+                               "capabilities": ["text", "tools"]
+                               + (["vision"] if row.get("vision") else []),
                                "context_window": row["context"]}
                 if template.get("api_key"):
                     models[key]["api_key"] = template["api_key"]
@@ -391,5 +433,7 @@ def format_report(ranked: dict) -> str:
         for i, r in enumerate(rows, 1):
             lines.append(f"  {i:>2}. {r['id']:<46} score={r['score']}/{len(PROBES)} "
                          f"{r['tok_s']:>7.1f} tok/s  p50={r['latency']:>5.2f}s  ctx={r['context']:,}"
-                         f"  tools={r.get('tools', 0)}/2")
+                         f"  tools={r.get('tools', 0)}/2"
+                         f"{'  vision' if r.get('vision') else ''}"
+                         f"  [{r.get('judged_by', 'rules')}]")
     return "\n".join(lines) or "no free models discovered"
