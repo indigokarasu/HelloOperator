@@ -113,6 +113,8 @@ class Settings:
     classify_margin: float = 0.08
     max_inflight: int = 0                 # 0 = unlimited (NFR-5)
     request_timeout_s: float = 600.0      # total cap, non-streaming only
+    stream_peek_s: float = 20.0           # hold a stream up to this long for its first
+                                          # data event, so an error there fails over
     stream_idle_timeout_s: float = 300.0  # inter-chunk cap for streams — a
                                           # healthy long generation must never
                                           # be killed by a total-body timeout
@@ -253,7 +255,8 @@ def _parse_settings(raw_router: dict, raw_routing: dict) -> Settings:
         if name in raw_router:
             setattr(s, name, str(raw_router[name]))
     for name in ("affinity_idle_timeout_s", "classify_margin",
-                 "request_timeout_s", "stream_idle_timeout_s", "connect_timeout_s",
+                 "request_timeout_s", "stream_idle_timeout_s", "stream_peek_s",
+                 "connect_timeout_s",
                  "shutdown_drain_s"):
         if name in raw_router:
             setattr(s, name, float(raw_router[name]))

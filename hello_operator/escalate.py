@@ -81,6 +81,44 @@ def refusal_matches(text: str, markers: list[str]) -> bool:
     return any(m.lower() in lowered for m in markers)
 
 
+def stream_error(obj) -> Optional[dict]:
+    """The error object of an SSE data payload, normalised to a dict, or None.
+    OpenRouter streams ``{"error": {"code": 502, "message": ..., "metadata":
+    {"error_type": "provider_unavailable"}}}`` after answering 200 when the
+    provider behind a model fails."""
+    err = obj.get("error") if isinstance(obj, dict) else None
+    if not err:
+        return None
+    return err if isinstance(err, dict) else {"message": str(err)}
+
+
+def stream_error_status(err: dict) -> int:
+    """HTTP status an in-stream error stands for (its ``code`` when that is one)."""
+    try:
+        code = int((err or {}).get("code"))
+    except (TypeError, ValueError):
+        return 502
+    return code if 400 <= code <= 599 else 502
+
+
+def first_data_event(buf: bytes):
+    """The first complete SSE ``data:`` payload in ``buf``: the parsed JSON, the
+    string "[DONE]", ``{}`` for non-JSON data, or None while no complete data line
+    has arrived. Comment lines (": OPENROUTER PROCESSING") are skipped."""
+    for raw in buf.split(b"\n")[:-1]:          # the last piece may be incomplete
+        line = raw.strip()
+        if not line.startswith(b"data:"):
+            continue
+        payload = line[5:].strip()
+        if payload == b"[DONE]":
+            return "[DONE]"
+        try:
+            return json.loads(payload)
+        except ValueError:
+            return {}
+    return None
+
+
 class StreamCollector:
     """Reassembles an assistant message from SSE chunks as they relay through.
 
@@ -95,6 +133,7 @@ class StreamCollector:
         self.finish_reason: Optional[str] = None
         self.model: str = ""
         self.usage: dict = {}
+        self.error: Optional[dict] = None   # an error object the backend streamed
         self._buf = b""
 
     def feed(self, chunk: bytes) -> None:
@@ -112,6 +151,9 @@ class StreamCollector:
         try:
             obj = json.loads(payload)
         except ValueError:
+            return
+        if isinstance(obj, dict) and obj.get("error"):
+            self.error = stream_error(obj)
             return
         self.model = obj.get("model") or self.model
         # The final chunk carries settled token counts and, on OpenRouter, the

@@ -27,8 +27,9 @@ from .affinity import AffinityMap, SessionState, derive_session_key
 from .capabilities import RequestProps, extract_props, model_ok
 from .classify import Classifier
 from .config import Config, ModelSpec, RoleSpec
-from .escalate import (StreamCollector, calls_signature, missing_required_call,
-                       refusal_matches, validate_tool_calls)
+from .escalate import (StreamCollector, calls_signature, first_data_event,
+                       missing_required_call, refusal_matches, stream_error,
+                       stream_error_status, validate_tool_calls)
 from .budget import Budget, estimate_usd, response_cost
 from .logging_ import DecisionLog
 
@@ -942,6 +943,29 @@ class Router:
             client_resp.close()
             return web.json_response(payload, status=client_resp.status, headers=headers)
 
+        # Hold the response until the backend's first data event (bounded by
+        # stream_peek_s). OpenRouter answers 200 and then streams an error object
+        # when the provider behind a model fails: {"error": {"code": 502,
+        # "message": "JSON error injected into SSE stream", "metadata":
+        # {"error_type": "provider_unavailable"}}}. Relayed, that commits the
+        # turn to a failure the router could have routed around -- and affinity
+        # then kept every retry on the same dead backend (2026-09-25: five
+        # minutes of failed Telegram turns). Nothing has been written yet, so an
+        # error here fails over exactly like an error status would.
+        it = client_resp.content.iter_any().__aiter__()
+        try:
+            head, first = await self._peek_first_event(it)
+        except BaseException:
+            client_resp.close()
+            raise
+        err = stream_error(first)
+        if err:
+            client_resp.close()
+            status = stream_error_status(err)
+            log.warning("%s: stream opened with a backend error (%s: %s); failing over",
+                        spec.key, status, str(err.get("message", ""))[:160])
+            raise _RetryableStatus(status)
+
         resp = web.StreamResponse(status=client_resp.status)
         resp.headers["Content-Type"] = client_resp.headers.get(
             "Content-Type", "text/event-stream")
@@ -956,7 +980,10 @@ class Router:
         aborted = ""
         try:
             try:
-                async for chunk in client_resp.content.iter_any():
+                if head:
+                    await resp.write(head)
+                    collector.feed(head)
+                async for chunk in it:
                     await resp.write(chunk)
                     collector.feed(chunk)
             finally:
@@ -972,6 +999,12 @@ class Router:
             except Exception:
                 pass  # client may already be gone; nothing left to salvage
 
+        if collector.error and not aborted:
+            # An error after content had flowed: the turn is committed, but it
+            # failed, and the session must not stay on this backend.
+            aborted = "backend error mid-stream: %s" % str(
+                collector.error.get("message", ""))[:160]
+            log.warning("%s: %s; arming escalation for the next turn", spec.key, aborted)
         message = collector.assembled()
         failures = []
         if props.wants_tools:
@@ -997,6 +1030,24 @@ class Router:
             decision.actual_usd = response_cost({"usage": collector.usage}, spec)
         self._log_decision(st, decision, routing_ms, escalation_failures=failures)
         return resp
+
+    async def _peek_first_event(self, it) -> tuple[bytes, object]:
+        """Read the stream until its first data event or stream_peek_s, whichever
+        comes first. Returns (bytes read, first payload or None)."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, float(self.cfg.settings.stream_peek_s))
+        head = b""
+        while True:
+            first = first_data_event(head)
+            if first is not None:
+                return head, first
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return head, None
+            try:
+                head += await asyncio.wait_for(it.__anext__(), remaining)
+            except (StopAsyncIteration, asyncio.TimeoutError):
+                return head, None
 
     async def _emit_as_stream(self, request, payload: dict,
                               headers: dict) -> web.StreamResponse:
