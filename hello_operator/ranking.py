@@ -76,6 +76,27 @@ def _ctx(entry: dict) -> int:
                or (entry.get("top_provider") or {}).get("context_length") or 0)
 
 
+def is_free_entry(entry: dict) -> bool:
+    """A catalogue entry that costs nothing: a ':free' id, or $0 prompt and completion
+    pricing (OpenRouter lists stealth models that way, with no suffix). Meta-routers
+    (``openrouter/*``) choose a backend per call, so they are not a model to rank."""
+    mid = str(entry.get("id") or "")
+    if mid.endswith(":free"):
+        return True
+    pricing = entry.get("pricing")
+    if mid.startswith("openrouter/") or not isinstance(pricing, dict):
+        return False
+    try:
+        return (float(pricing.get("prompt")) == 0 and float(pricing.get("completion")) == 0
+                and float(pricing.get("request") or 0) == 0)
+    except (TypeError, ValueError):
+        return False
+
+
+def _model_free(model: dict) -> bool:
+    return bool(model.get("free")) or str(model.get("id", "")).endswith(":free")
+
+
 async def _catalogue(http: aiohttp.ClientSession, endpoint: str, api_key: str) -> list[dict]:
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     try:
@@ -208,7 +229,7 @@ async def rank(http: aiohttp.ClientSession, raw_cfg: dict, keys: dict) -> dict:
         rows = []
         for entry in await _catalogue(http, endpoint, api_key):
             mid = str(entry.get("id") or "")
-            if not mid.endswith(":free"):
+            if not is_free_entry(entry):
                 continue
             if _ctx(entry) < int(s["min_context"]):
                 continue
@@ -226,7 +247,7 @@ async def rank(http: aiohttp.ClientSession, raw_cfg: dict, keys: dict) -> dict:
                 continue
             rows.append({"id": mid, "score": score, "tok_s": round(tok_s, 1),
                          "latency": round(latency, 2), "context": _ctx(entry),
-                         "tools": tools})
+                         "tools": tools, "zero_priced": not mid.endswith(":free")})
         # Tool ability outranks everything: for an agent it is the capability the
         # others are useless without.
         rows.sort(key=lambda r: (-r.get("tools", 0), -r["score"], -r["tok_s"], -r["context"]))
@@ -303,6 +324,8 @@ def apply_ranking(config_path: str, ranked: dict, raw_cfg: dict) -> tuple[bool, 
                     models[key]["api_key"] = template["api_key"]
             else:
                 models[key]["context_window"] = row["context"] or models[key].get("context_window")
+            if row.get("zero_priced"):
+                models[key]["free"] = True
             free_keys.append(key)
 
     if not free_keys:
@@ -319,14 +342,14 @@ def apply_ranking(config_path: str, ranked: dict, raw_cfg: dict) -> tuple[bool, 
             continue
         paid_tail = [k for k in cascade
                      if k in models and models[k].get("id") not in ranked_ids
-                     and not str(models[k].get("id", "")).endswith(":free")]
+                     and not _model_free(models[k])]
         # A free model that could not be probed this run -- rate-capped (429),
         # forbidden (403), timed out -- is UNKNOWN, not bad. Dropping it lets one
         # transient cap quietly shrink the cascade, which is how a fleet ends up
         # one outage away from the paid tail. Keep it, below everything proven.
         unproven = [k for k in cascade
                     if k in models and k not in free_keys
-                    and str(models[k].get("id", "")).endswith(":free")
+                    and _model_free(models[k])
                     and models[k].get("id") not in ranked_ids
                     and not (deny and any(d in str(models[k].get("id", "")).lower()
                                           for d in deny))]

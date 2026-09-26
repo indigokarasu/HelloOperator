@@ -73,6 +73,7 @@ class ModelSpec:
     param_map: dict = field(default_factory=dict)     # {param: {from_value: to_value}}
     price_in: float = 0.0    # USD per 1M prompt tokens, operator-declared
     price_out: float = 0.0   # USD per 1M completion tokens
+    free: bool = False       # zero-priced without a ':free' suffix (e.g. OpenRouter stealth models)
 
     @property
     def probes_enabled(self) -> bool:
@@ -224,7 +225,8 @@ def _parse_model(key: str, raw: dict, detected: dict, warnings: list) -> ModelSp
                      drop_params=list(raw.get("drop_params") or []),
                      param_map=dict(raw.get("param_map") or {}),
                      price_in=float(raw.get("price_in") or 0),
-                     price_out=float(raw.get("price_out") or 0))
+                     price_out=float(raw.get("price_out") or 0),
+                     free=bool(raw.get("free", False)))
 
 
 def _parse_settings(raw_router: dict, raw_routing: dict) -> Settings:

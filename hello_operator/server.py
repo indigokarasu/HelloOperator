@@ -59,6 +59,15 @@ def _denied(spec, denylist) -> bool:
 
 
 def _is_free(spec) -> bool:
+    """Costs nothing to call: a ':free' id, or a model the ranking found priced at $0 without
+    that suffix (OpenRouter's stealth models), recorded as ``free: true``."""
+    return bool(getattr(spec, "free", False)) or _shares_free_quota(spec)
+
+
+def _shares_free_quota(spec) -> bool:
+    """':free' variants draw on the provider's shared free-tier quota, which is what the
+    provider-wide breaker tracks. Stealth models have their own limits: a spent free tier
+    must not take them out of rotation, and their 429s must not trip it."""
     return str(getattr(spec, "id", "")).endswith(":free")
 
 
@@ -587,7 +596,7 @@ class Router:
                 # escalation or a pin.
                 last_error = f"{spec.key}: denylisted by operator"
                 continue
-            if _is_free(spec) and free_exhausted(spec.endpoint):
+            if _shares_free_quota(spec) and free_exhausted(spec.endpoint):
                 last_error = f"{spec.key}: free tier on {spec.endpoint} exhausted"
                 continue
             if i > 0:
@@ -608,7 +617,7 @@ class Router:
                 continue
             except _RetryableStatus as e:
                 last_error = f"{spec.key}: backend returned {e.status}"
-                if e.status in (402, 429) and _is_free(spec):
+                if e.status in (402, 429) and _shares_free_quota(spec):
                     mark_free_exhausted(spec.endpoint)
                 continue
         # Last resort: everything was skipped or failed, and we are about to

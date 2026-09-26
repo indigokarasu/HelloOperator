@@ -97,6 +97,37 @@ def test_free_breaker_expires(monkeypatch):
 
 def test_is_free_only_matches_free_ids():
     class S:
-        def __init__(self, i): self.id = i
+        def __init__(self, i, free=False): self.id, self.free = i, free
     assert _is_free(S("vendor/model:free"))
     assert not _is_free(S("vendor/model"))
+    assert _is_free(S("stealth/space-bunny-alpha", free=True))
+
+
+def test_zero_priced_catalogue_entries_count_as_free():
+    zero = {"prompt": "0", "completion": "0"}
+    assert ranking.is_free_entry({"id": "vendor/model:free"})
+    assert ranking.is_free_entry({"id": "stealth/space-bunny-alpha", "pricing": zero})
+    assert not ranking.is_free_entry({"id": "openrouter/auto", "pricing": zero})
+    assert not ranking.is_free_entry({"id": "vendor/paid", "pricing": {"prompt": "0.0000002", "completion": "0"}})
+    assert not ranking.is_free_entry({"id": "vendor/unpriced"})
+
+
+def test_zero_priced_model_joins_the_free_block_flagged_free(tmp_path):
+    models = {"p1": {"id": "vendor/paid", "endpoint": OR, "context_window": 1},
+              "moon": {"id": "moondream", "endpoint": "http://local/v1", "context_window": 2048}}
+    path = _cfg(tmp_path, models, ["p1"])
+    row = dict(_row("stealth/space-bunny-alpha", 5, 1.0), zero_priced=True)
+    ranking.apply_ranking(path, {NOUS: [], OR: [row]}, yaml.safe_load(open(path)))
+    out = yaml.safe_load(open(path))
+    cascade = out["roles"]["chat"]["cascade"]
+    first = out["models"][cascade[0]]
+    assert first["id"] == "stealth/space-bunny-alpha" and first.get("free") is True
+    assert out["models"][cascade[-1]]["id"] == "vendor/paid"
+
+
+def test_stealth_model_ignores_the_free_tier_breaker():
+    from hello_operator.server import _shares_free_quota
+    class S:
+        def __init__(self, i, free=False): self.id, self.free = i, free
+    assert _shares_free_quota(S("vendor/model:free"))
+    assert not _shares_free_quota(S("stealth/space-bunny-alpha", free=True))
