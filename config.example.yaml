@@ -20,6 +20,9 @@ router:
   hop_limit: 1                    # max escalation hops per session (FR-7)
   classify_margin: 0.08           # classifier disagreement needed to switch roles
   max_inflight: 0                 # >0 caps concurrent backend requests (NFR-5)
+  shutdown_drain_s: 5             # on stop, in-flight turns get this long to finish,
+                                  # then are cut so the process exits well inside
+                                  # systemd's 90 s stop timeout
   repeat_call_threshold: 3        # identical call repeated this often => escalate
   decision_log: ""                # path to a JSONL decision log; empty disables (FR-11)
   state_dir: ~/.hello-operator

@@ -45,7 +45,9 @@ class FakeBackend:
     """One fake inference server. `behaviors` maps backend model id -> a
     callable(body, call_index) -> dict describing the assistant message:
       {"content": "..."} and/or {"tool_calls": [...]}
-    The backend honors body["stream"] by emitting SSE chunks.
+    The backend honors body["stream"] by emitting SSE chunks. A streamed spec
+    may also give "chunks" (explicit content deltas) and "chunk_delay_s" (a
+    pause before each delta), for a generation that is still running.
     """
 
     def __init__(self, behaviors: dict, native: str = ""):
@@ -84,7 +86,9 @@ class FakeBackend:
             content = message.get("content") or ""
             # split content into two chunks to exercise reassembly
             half = max(1, len(content) // 2)
-            if content:
+            if spec.get("chunks"):
+                deltas += [{"content": c} for c in spec["chunks"]]
+            elif content:
                 deltas.append({"content": content[:half]})
                 deltas.append({"content": content[half:]})
             for i, tc in enumerate(message.get("tool_calls") or []):
@@ -97,10 +101,17 @@ class FakeBackend:
                                                "function": {"arguments": args[:mid]}}]})
                 deltas.append({"tool_calls": [{"index": i,
                                                "function": {"arguments": args[mid:]}}]})
-            for d in deltas:
-                chunk = {"id": "cc1", "object": "chat.completion.chunk", "model": model,
-                         "choices": [{"index": 0, "delta": d, "finish_reason": None}]}
-                await resp.write(b"data: " + json.dumps(chunk).encode() + b"\n\n")
+            delay = float(spec.get("chunk_delay_s") or 0)
+            try:
+                for d in deltas:
+                    if delay:
+                        await asyncio.sleep(delay)
+                    chunk = {"id": "cc1", "object": "chat.completion.chunk",
+                             "model": model,
+                             "choices": [{"index": 0, "delta": d, "finish_reason": None}]}
+                    await resp.write(b"data: " + json.dumps(chunk).encode() + b"\n\n")
+            except ConnectionError:
+                return resp  # the router hung up mid-generation; nothing to finish
             done = {"id": "cc1", "object": "chat.completion.chunk", "model": model,
                     "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]}
             await resp.write(b"data: " + json.dumps(done).encode() + b"\n\n")

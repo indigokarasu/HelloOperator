@@ -105,6 +105,11 @@ def _err(status: int, message: str, code: str = "router_error") -> web.Response:
         {"error": {"message": message, "type": code, "code": code}}, status=status)
 
 
+# How long a cancelled turn gets to unwind at shutdown. Handlers do not catch
+# CancelledError, so this bounds a bug, not an expected wait.
+_UNWIND_S = 5.0
+
+
 class Router:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -121,6 +126,9 @@ class Router:
         self._sem: Optional[asyncio.Semaphore] = (
             asyncio.Semaphore(cfg.settings.max_inflight)
             if cfg.settings.max_inflight > 0 else None)
+        # Chat turns in flight: a future resolved when the handler returns ->
+        # the task running it. shutdown() drains these, then cuts the rest.
+        self._inflight: dict[asyncio.Future, asyncio.Task] = {}
 
     # ------------------------------------------------------------ lifecycle
 
@@ -128,6 +136,41 @@ class Router:
         self.http = aiohttp.ClientSession()
         self.classifier = Classifier(self.cfg, self.http)
         await self.classifier.prepare()
+
+    async def shutdown(self, app: web.Application) -> None:
+        """Drain in-flight turns for router.shutdown_drain_s, then cut the rest.
+
+        Left to itself aiohttp waits shutdown_timeout (60 s) for a running
+        handler and then waits another 60 s without cancelling it, so one long
+        stream held `systemctl stop` past systemd's 90 s TimeoutStopSec until
+        SIGKILL: 21 of 165 stops in 14 days, each a 90 s outage for every Hermes
+        profile. The listener is already closed when this runs, so the drain
+        refuses new requests for as long as it lasts; it stays short.
+
+        A cut turn is aborted, not ended: the connection closes without the
+        final chunk, so the client sees an incomplete body it can retry rather
+        than a truncated answer that looks finished.
+        """
+        pending = set(self._inflight)
+        if not pending:
+            return
+        drain = max(0.0, self.cfg.settings.shutdown_drain_s)
+        log.info("shutdown: waiting up to %.1fs for %d in-flight request(s)",
+                 drain, len(pending))
+        if drain:
+            _, pending = await asyncio.wait(pending, timeout=drain)
+        if not pending:
+            return
+        log.warning("shutdown: cutting %d request(s) still in flight after the "
+                    "%.1fs drain", len(pending), drain)
+        for done in pending:
+            task = self._inflight.get(done)
+            if task is not None:
+                task.cancel()
+        _, stuck = await asyncio.wait(pending, timeout=_UNWIND_S)
+        if stuck:
+            log.error("shutdown: %d request(s) did not unwind within %.0fs of "
+                      "being cancelled", len(stuck), _UNWIND_S)
 
     async def cleanup(self, app: web.Application) -> None:
         if self.http:
@@ -505,6 +548,17 @@ class Router:
         return web.json_response(self.status_payload(request))
 
     async def handle_chat(self, request: web.Request) -> web.StreamResponse:
+        done = asyncio.get_running_loop().create_future()
+        task = asyncio.current_task()
+        if task is not None:
+            self._inflight[done] = task
+        try:
+            return await self._handle_chat(request)
+        finally:
+            self._inflight.pop(done, None)
+            done.set_result(None)
+
+    async def _handle_chat(self, request: web.Request) -> web.StreamResponse:
         t0 = time.monotonic()
         try:
             body = await request.json()
@@ -1075,6 +1129,7 @@ def build_app(cfg: Config) -> web.Application:
     app = web.Application(client_max_size=256 * 1024 * 1024)
     app[ROUTER_KEY] = router
     app.on_startup.append(router.startup)
+    app.on_shutdown.append(router.shutdown)
     app.on_cleanup.append(router.cleanup)
     app.router.add_post("/v1/chat/completions", router.handle_chat)
     app.router.add_get("/v1/models", router.handle_models)

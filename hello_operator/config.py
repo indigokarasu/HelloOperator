@@ -115,6 +115,10 @@ class Settings:
                                           # healthy long generation must never
                                           # be killed by a total-body timeout
     connect_timeout_s: float = 10.0
+    shutdown_drain_s: float = 5.0         # on stop, in-flight turns get this long
+                                          # to finish before they are cut; the
+                                          # listener is already closed, so a long
+                                          # drain is an outage for new requests
     assumed_completion_tokens: int = 1024
     media_token_estimate: int = 1024      # flat per-image/audio-part estimate
     context_safety_margin: int = 256
@@ -246,7 +250,8 @@ def _parse_settings(raw_router: dict, raw_routing: dict) -> Settings:
         if name in raw_router:
             setattr(s, name, str(raw_router[name]))
     for name in ("affinity_idle_timeout_s", "classify_margin",
-                 "request_timeout_s", "stream_idle_timeout_s", "connect_timeout_s"):
+                 "request_timeout_s", "stream_idle_timeout_s", "connect_timeout_s",
+                 "shutdown_drain_s"):
         if name in raw_router:
             setattr(s, name, float(raw_router[name]))
     for name in ("hop_limit", "max_inflight", "assumed_completion_tokens",

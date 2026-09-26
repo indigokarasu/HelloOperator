@@ -20,6 +20,8 @@ from .server import build_app
 
 log = logging.getLogger("router")
 
+_SHUTDOWN_BACKSTOP_S = 5.0
+
 
 async def _check(cfg: Config, probe: bool) -> int:
     """Startup validation: endpoints respond; detection vs declaration
@@ -181,8 +183,12 @@ def main(argv: list[str] | None = None) -> int:
              mode, cfg.settings.listen_host, cfg.settings.listen_port,
              cfg.settings.logical_model,
              "loopback" if not cfg.settings.allow_non_loopback else "NON-LOOPBACK opt-in")
+    # Chat turns are drained and cut by Router.shutdown before aiohttp's own
+    # wait starts. That wait now only covers what is left (a response still
+    # being written, a status call), and aiohttp spends up to twice this on
+    # it; its 60 s default is what held stops past systemd's 90 s SIGKILL.
     web.run_app(app, host=cfg.settings.listen_host, port=cfg.settings.listen_port,
-                print=None)
+                print=None, shutdown_timeout=_SHUTDOWN_BACKSTOP_S)
     return 0
 
 
