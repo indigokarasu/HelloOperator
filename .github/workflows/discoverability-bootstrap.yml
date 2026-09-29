@@ -1,21 +1,19 @@
 name: Repository discoverability bootstrap
 on:
+  workflow_dispatch:
   push:
-    branches: [main]
+    paths:
+      - .github/workflows/discoverability-bootstrap.yml
 permissions:
   contents: write
   issues: write
 jobs:
-  metadata:
+  discoverability:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
     steps:
-      - name: Repository description and topics
-        run: |
-          gh api --method PATCH "repos/$REPO" -f description='HelloOperator: OpenAI-compatible model/provider router for local and remote LLMs with role routing, sticky sessions, capability discovery, and failover.'
-          gh api --method PUT "repos/$REPO/topics" -H "Accept: application/vnd.github+json" -F 'names[]=ai-infrastructure' -F 'names[]=llama-cpp' -F 'names[]=llm' -F 'names[]=lm-studio' -F 'names[]=local-llm' -F 'names[]=model-routing' -F 'names[]=ollama' -F 'names[]=openai-compatible' -F 'names[]=python' -F 'names[]=vllm'
       - name: Standard labels
         continue-on-error: true
         run: |
