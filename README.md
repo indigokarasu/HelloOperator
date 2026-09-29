@@ -2,6 +2,8 @@
   <img src="./assets/readme/hero.jpg" width="100%" alt="HelloOperator">
 </p>
 
+**HelloOperator is an OpenAI-compatible model router for local and remote LLMs, with capability discovery, role-based routing, sticky sessions, and failover.**
+
 HelloOperator is a model/provider router for local and remote models. it sits in front of the models you already run and picks which one
 handles each conversation turn. Clients see a single OpenAI-compatible endpoint
 with a single model name. Behind it, requests get matched to a role (chat, code,
