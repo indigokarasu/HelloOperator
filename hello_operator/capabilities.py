@@ -27,6 +27,7 @@ class RequestProps:
     tools_sig: str          # stable signature of the tool set (FR-6 transition input)
     last_user_text: str     # classification input (FR-4)
     msg_count: int
+    max_tokens_explicit: bool = False   # the client set max_tokens itself
 
 
 def _part_text(content) -> str:
@@ -106,18 +107,20 @@ def extract_props(body: dict, settings: Settings) -> RequestProps:
         except (TypeError, ValueError):
             pass
 
-    max_tokens = body.get("max_tokens") or body.get("max_completion_tokens") \
-        or settings.assumed_completion_tokens
+    requested = body.get("max_tokens") or body.get("max_completion_tokens")
+    max_tokens = requested or settings.assumed_completion_tokens
     try:
         max_tokens = int(max_tokens)
     except (TypeError, ValueError):
+        requested = None
         max_tokens = settings.assumed_completion_tokens
 
     return RequestProps(
         has_image=has_image, has_audio=has_audio,
         wants_tools=bool(tools), tool_choice_required=tool_choice_required,
         est_tokens=est, max_tokens=max_tokens, tools_sig=tools_sig,
-        last_user_text=last_user_text, msg_count=len(messages))
+        last_user_text=last_user_text, msg_count=len(messages),
+        max_tokens_explicit=bool(requested))
 
 
 def model_ok(spec: ModelSpec, props: RequestProps, settings: Settings) -> tuple[bool, str]:
@@ -129,9 +132,15 @@ def model_ok(spec: ModelSpec, props: RequestProps, settings: Settings) -> tuple[
         return False, f"request contains audio content but model '{spec.key}' does not declare audio"
     if props.wants_tools and "tools" not in spec.capabilities:
         return False, f"request supplies tool definitions but model '{spec.key}' does not declare tools"
-    needed = props.est_tokens + props.max_tokens + settings.context_safety_margin
+    # Only a completion the client asked for is a hard requirement. Without
+    # max_tokens the backend simply stops at its context limit, and the assumed
+    # budget (still used for cost estimates) ruled out the local 2048-token
+    # vision model for every Hermes screenshot, leaving a rate-limited free
+    # model as the only candidate (owner report 2026-09-29).
+    completion = props.max_tokens if props.max_tokens_explicit else 0
+    needed = props.est_tokens + completion + settings.context_safety_margin
     if needed > spec.context_window:
-        return False, (f"estimated {props.est_tokens} prompt tokens + {props.max_tokens} "
+        return False, (f"estimated {props.est_tokens} prompt tokens + {completion} "
                        f"completion tokens exceed model '{spec.key}' context window "
                        f"of {spec.context_window}")
     return True, ""

@@ -144,6 +144,24 @@ def test_context_window_filter():
     assert not ok and "context window" in why
 
 
+def test_unrequested_completion_budget_does_not_disqualify_a_small_model():
+    """A client that sets no max_tokens has not asked for the router's assumed
+    completion; a model the prompt fits in stays eligible. Hermes' vision tool
+    sends no max_tokens, and the assumption alone ruled out the local 2048-token
+    vision model, so a rate-limited free model was the only one ever tried."""
+    from hello_operator.config import ModelSpec
+    spec = ModelSpec(key="eye", id="eye", endpoint="e", capabilities={"text", "vision"},
+                     context_window=2048)
+    msg = {"role": "user", "content": [
+        {"type": "text", "text": "Describe this page. Is the filter bar visible?"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}}]}
+    ok, why = model_ok(spec, _props({"messages": [msg]}), Settings())
+    assert ok, why
+    # An explicit request for more than fits is still refused.
+    ok, why = model_ok(spec, _props({"messages": [msg], "max_tokens": 2000}), Settings())
+    assert not ok and "context window" in why
+
+
 def test_vision_filter_names_constraint():
     from hello_operator.config import ModelSpec
     spec = ModelSpec(key="s", id="s", endpoint="e", capabilities={"text"},
