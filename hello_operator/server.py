@@ -121,11 +121,27 @@ def key_cooling(spec, key: str) -> bool:
     return any(_KEY_COOLDOWN.get((qk, s), 0.0) > now for s in _key_scopes(spec))
 
 
-def set_key_aside(spec, key: str, status: int) -> None:
+def model_scoped_429(detail: str) -> bool:
+    """True when a 429's body says the limit belongs to that one MODEL: its
+    provider is throttling it (OpenRouter: "temporarily rate-limited upstream")
+    or it has its own share (Nous: "this model's current fair-share rate
+    limit"). Anything else, the account's daily free cap included, keeps the
+    account-wide reading."""
+    d = (detail or "").lower()
+    return "upstream" in d or "this model" in d
+
+
+def set_key_aside(spec, key: str, status: int, detail: str = "") -> None:
     qk = quota_key(spec.endpoint, key)
-    if status in (402, 429) and _shares_free_quota(spec):
+    # A throttled model is not an exhausted account. Reading every free 429 as
+    # the account's quota skipped all the other free models on the key for 15
+    # minutes: a rate-limited gemma sent screenshots to the local model while a
+    # free model that reads them well sat one position behind it (2026-09-29).
+    model_only = status == 429 and model_scoped_429(detail)
+    if status in (402, 429) and _shares_free_quota(spec) and not model_only:
         mark_free_exhausted(qk)
-    if len(getattr(spec, "api_keys", None) or []) > 1 and status in _ROTATE_ON:
+    if status in _ROTATE_ON and (len(getattr(spec, "api_keys", None) or []) > 1
+                                 or model_only):
         scope = _refusal_scope(spec, status)
         _KEY_COOLDOWN[(qk, scope)] = time.monotonic() + _KEY_COOLDOWN_S[status]
         log.warning("%s: key %d/%d answered %s; set aside (%s) for %.0fs",
@@ -832,7 +848,7 @@ class Router:
                     break
                 except _RetryableStatus as e:
                     last_error = f"{spec.key}: backend returned {e.status}"
-                    set_key_aside(spec, key, e.status)
+                    set_key_aside(spec, key, e.status, e.detail)
                     if e.status not in _ROTATE_ON:
                         break
         # Last resort: everything was skipped or failed, and we are about to
@@ -907,7 +923,8 @@ class Router:
                     if prev is not None:
                         spec, decision, payload, message, failures = prev
                         break
-                    raise _RetryableStatus(client_resp.status)
+                    raise _RetryableStatus(client_resp.status,
+                                           await _error_detail(client_resp))
                 try:
                     payload = await client_resp.json(content_type=None)
                 except (ValueError, aiohttp.ClientError):
@@ -992,8 +1009,9 @@ class Router:
         assert spec is not None
         client_resp = await self._post_backend(request, spec, body, stream=True)
         if client_resp.status >= 500 or client_resp.status in _RETRYABLE_STATUSES:
+            detail = await _error_detail(client_resp)
             client_resp.close()
-            raise _RetryableStatus(client_resp.status)
+            raise _RetryableStatus(client_resp.status, detail)
         collector = StreamCollector()
         headers = self._router_headers(decision, routing_ms)
         if client_resp.status >= 400:
@@ -1026,7 +1044,7 @@ class Router:
             status = stream_error_status(err)
             log.warning("%s: stream opened with a backend error (%s: %s); failing over",
                         spec.key, status, str(err.get("message", ""))[:160])
-            raise _RetryableStatus(status)
+            raise _RetryableStatus(status, json.dumps(err)[:2048])
 
         resp = web.StreamResponse(status=client_resp.status)
         resp.headers["Content-Type"] = client_resp.headers.get(
@@ -1283,8 +1301,21 @@ class Router:
 
 
 class _RetryableStatus(Exception):
-    def __init__(self, status: int):
+    def __init__(self, status: int, detail: str = ""):
         self.status = status
+        self.detail = detail   # start of the error body; says whose limit a 429 is
+
+
+async def _error_detail(client_resp: aiohttp.ClientResponse) -> str:
+    """The first bytes of a refusal's body, for telling a throttled model from
+    an exhausted account. Bounded and best-effort: it never delays failover."""
+    if client_resp.status != 429:
+        return ""
+    try:
+        raw = await asyncio.wait_for(client_resp.content.read(2048), 2.0)
+        return raw.decode("utf-8", "replace")
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+        return ""
 
 
 # Display surfaces (Telegram, the CLI) render the model from CONFIG, so while the
