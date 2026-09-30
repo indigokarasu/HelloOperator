@@ -76,6 +76,8 @@ class ModelSpec:
     free: bool = False       # zero-priced without a ':free' suffix (e.g. OpenRouter stealth models)
     api_keys: list = field(default_factory=list)   # rotation pool from router.key_pools;
                                                    # api_key is its first entry
+    api_key_ref: str = ""    # api_key as written (e.g. ${NOUS_API_KEY}); re-resolved
+                             # when router.env_files change
 
     @property
     def probes_enabled(self) -> bool:
@@ -130,6 +132,8 @@ class Settings:
     refusal_markers: list[str] = field(default_factory=list)  # MAY; empty = off
     denylist: list[str] = field(default_factory=list)  # operator-banned models
     key_pools: dict = field(default_factory=dict)  # endpoint -> [key, ...], resolved from env
+    key_pool_refs: dict = field(default_factory=dict)  # router.key_pools as written
+    env_files: list[str] = field(default_factory=list)  # re-read for keys when they change
     budget_daily_usd: float = 0.0   # 0 disables; otherwise a hard per-UTC-day ceiling
     refusal_escalate: bool = False        # advisory only unless explicitly enabled
     decision_log: str = ""                # path; empty disables (FR-11)
@@ -226,10 +230,11 @@ def _parse_model(key: str, raw: dict, detected: dict, warnings: list) -> ModelSp
     if location not in LOCATIONS:
         raise ConfigError(f"model '{key}': location must be one of {sorted(LOCATIONS)}")
 
-    api_key = os.path.expandvars(str(raw.get("api_key", "") or ""))
+    api_key_ref = str(raw.get("api_key", "") or "")
     return ModelSpec(key=key, id=str(mid), endpoint=str(endpoint).rstrip("/"),
                      capabilities=set(caps), context_window=int(ctx),
-                     residency=residency, speed_class=speed, api_key=api_key,
+                     residency=residency, speed_class=speed,
+                     api_key=expand_refs(api_key_ref, os.environ), api_key_ref=api_key_ref,
                      location=location, probe=raw.get("probe"), provenance=prov,
                      drop_params=list(raw.get("drop_params") or []),
                      param_map=dict(raw.get("param_map") or {}),
@@ -276,6 +281,8 @@ def _parse_settings(raw_router: dict, raw_routing: dict) -> Settings:
         # ("ling-3.0-flash-sante") bans that model on every provider serving it.
         s.denylist = [str(x).strip().lower()
                       for x in (raw_router["denylist"] or []) if str(x).strip()]
+    if "env_files" in raw_router:
+        s.env_files = [os.path.expanduser(str(x)) for x in (raw_router["env_files"] or [])]
 
     if s.switch_cost not in ("low", "high"):
         raise ConfigError("router.switch_cost must be 'low' or 'high'")
@@ -286,7 +293,67 @@ def _parse_settings(raw_router: dict, raw_routing: dict) -> Settings:
     return s
 
 
-def _parse_key_pools(raw_pools, warnings: list) -> dict:
+_REF = re.compile(r"\$(?:\{(\w+)\}|(\w+))")
+
+
+def expand_refs(value: str, env) -> str:
+    """os.path.expandvars against ``env`` instead of the process environment.
+    Unset names are left as written, exactly as expandvars leaves them."""
+    def sub(m):
+        name = m.group(1) or m.group(2)
+        return env[name] if name in env else m.group(0)
+    return _REF.sub(sub, value) if "$" in value else value
+
+
+def referenced_vars(models, settings: "Settings") -> list[str]:
+    """Environment names the configured keys are read from."""
+    refs = [getattr(s, "api_key_ref", "") or "" for s in models]
+    for pool in (settings.key_pool_refs or {}).values():
+        refs += [str(r) for r in ([pool] if isinstance(pool, str) else pool or [])]
+    names = []
+    for ref in refs:
+        for m in _REF.finditer(ref):
+            name = m.group(1) or m.group(2)
+            if name not in names:
+                names.append(name)
+    return names
+
+
+def read_env_file(path: str) -> dict[str, str]:
+    """KEY=VALUE lines as systemd's EnvironmentFile reads them: blank lines and
+    '#' comments skipped, one pair of surrounding quotes removed."""
+    out = {}
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith(("#", ";")) or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            v = v.strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+                v = v[1:-1]
+            out[k.strip()] = v
+    return out
+
+
+def resolve_keys(models, settings: "Settings", warnings: list, env=None) -> None:
+    """(Re)resolve every model's key and the key pools against ``env`` (default:
+    the process environment). Called at load, and by the router whenever
+    router.env_files change, so a rotated credential needs no restart."""
+    env = os.environ if env is None else env
+    settings.key_pools = _parse_key_pools(settings.key_pool_refs, warnings, env)
+    for spec in models:
+        spec.api_key = expand_refs(spec.api_key_ref, env)
+        pool = settings.key_pools.get(spec.endpoint.rstrip("/"))
+        if pool:
+            # The pool replaces the model's own key: every model on the endpoint
+            # rotates across the same accounts.
+            spec.api_keys, spec.api_key = list(pool), pool[0]
+        else:
+            spec.api_keys = [spec.api_key] if spec.api_key else []
+
+
+def _parse_key_pools(raw_pools, warnings: list, env=None) -> dict:
     """router.key_pools: {endpoint: [${ENV_VAR}, ...]}. Several accounts' keys for
     one provider, rotated per request (see server.KeyRotation).
 
@@ -299,6 +366,7 @@ def _parse_key_pools(raw_pools, warnings: list) -> dict:
         return {}
     if not isinstance(raw_pools, dict):
         raise ConfigError("router.key_pools must map an endpoint to a list of keys")
+    env = os.environ if env is None else env
     pools: dict[str, list[str]] = {}
     for endpoint, refs in raw_pools.items():
         if isinstance(refs, str):
@@ -306,7 +374,7 @@ def _parse_key_pools(raw_pools, warnings: list) -> dict:
         keys = []
         for ref in refs or []:
             ref = str(ref)
-            val = os.path.expandvars(ref)
+            val = expand_refs(ref, env)
             if not val or (val == ref and "$" in ref):   # expandvars leaves unset vars as-is
                 warnings.append(f"router.key_pools[{endpoint}]: {ref} is not set in the "
                                 "environment; dropped from the rotation")
@@ -349,15 +417,8 @@ def load(path: str, detected_cache: Optional[dict[str, dict]] = None) -> Config:
     for key, m in raw_models.items():
         models[str(key)] = _parse_model(str(key), m or {}, detected_cache.get(str(key), {}), warnings)
 
-    settings.key_pools = _parse_key_pools((raw.get("router") or {}).get("key_pools"), warnings)
-    for spec in models.values():
-        pool = settings.key_pools.get(spec.endpoint.rstrip("/"))
-        if pool:
-            # The pool replaces the model's own key: every model on the endpoint
-            # rotates across the same accounts.
-            spec.api_keys, spec.api_key = list(pool), pool[0]
-        elif spec.api_key:
-            spec.api_keys = [spec.api_key]
+    settings.key_pool_refs = (raw.get("router") or {}).get("key_pools") or {}
+    resolve_keys(models.values(), settings, warnings)
 
     embedding: Optional[ModelSpec] = None
     if raw.get("embedding"):

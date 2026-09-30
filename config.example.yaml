@@ -20,6 +20,10 @@ router:
   hop_limit: 1                    # max escalation hops per session (FR-7)
   classify_margin: 0.08           # classifier disagreement needed to switch roles
   max_inflight: 0                 # >0 caps concurrent backend requests (NFR-5)
+  # env_files: [/etc/hello-operator.env]   # the files systemd loads keys from; re-read
+  #                               # when they change, so a rotated key (${VAR} in api_key
+  #                               # or key_pools) applies without a restart. /healthz
+  #                               # shows a sha256 prefix of each key in use.
   shutdown_drain_s: 5             # on stop, in-flight turns get this long to finish,
                                   # then are cut so the process exits well inside
                                   # systemd's 90 s stop timeout

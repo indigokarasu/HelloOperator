@@ -26,6 +26,7 @@ from aiohttp import web
 from .affinity import AffinityMap, SessionState, derive_session_key
 from .capabilities import RequestProps, extract_props, model_ok
 from .classify import Classifier
+from . import config as config_mod
 from .config import Config, ModelSpec, RoleSpec
 from .escalate import (StreamCollector, calls_signature, first_data_event,
                        missing_required_call, refusal_matches, stream_error,
@@ -215,6 +216,64 @@ class Router:
         # Chat turns in flight: a future resolved when the handler returns ->
         # the task running it. shutdown() drains these, then cuts the rest.
         self._inflight: dict[asyncio.Future, asyncio.Task] = {}
+        self._env_sig: Optional[tuple] = None
+        self._env: dict[str, str] = dict(os.environ)
+        self._reload_keys()
+
+    # ------------------------------------------------------------ credentials
+
+    def _reload_keys(self) -> None:
+        """Re-resolve every key when router.env_files change.
+
+        The Nous token lives 60 minutes and used to reach the router only by a
+        restart. Restarts cut live turns, so the sync that rotates it deferred
+        and then skipped them while turns were in flight, which on a busy
+        router is nearly always: the process kept an expired token and every
+        Nous model answered 401 (112 in one hour on 2026-09-29). One stat per
+        file per request; the files are read only when one has changed. A file
+        that is missing contributes nothing, so the keys systemd put in the
+        process environment at start stay in force.
+        """
+        paths = self.cfg.settings.env_files
+        if not paths:
+            return
+        sig = []
+        for p in paths:
+            try:
+                st = os.stat(p)
+                sig.append((p, st.st_mtime_ns, st.st_size))
+            except OSError:
+                sig.append((p, None, None))
+        sig = tuple(sig)
+        if sig == self._env_sig:
+            return
+        env = dict(os.environ)
+        for p, mtime, _ in sig:
+            if mtime is None:
+                continue
+            try:
+                env.update(config_mod.read_env_file(p))
+            except OSError as e:
+                log.warning("keys: cannot read %s (%s); keeping what it held before", p, e)
+                return   # retry on the next request rather than drop keys
+        before = self.key_fingerprints()
+        self._env, self._env_sig = env, sig
+        warnings: list[str] = []
+        specs = list(self.cfg.models.values()) + ([self.cfg.embedding] if self.cfg.embedding else [])
+        config_mod.resolve_keys(specs, self.cfg.settings, warnings, env)
+        for w in warnings:
+            log.warning("keys: %s", w)
+        changed = [n for n, fp in self.key_fingerprints().items() if before.get(n) != fp]
+        if changed and before:
+            log.info("keys: %s changed in %s; applied without a restart",
+                     ", ".join(changed), ", ".join(paths))
+
+    def key_fingerprints(self) -> dict[str, Optional[str]]:
+        """sha256 prefix of each key the router holds, by environment name: lets
+        the rotation confirm a new key is in use. Never the key itself."""
+        names = config_mod.referenced_vars(self.cfg.models.values(), self.cfg.settings)
+        return {n: (hashlib.sha256(self._env[n].encode()).hexdigest()[:12]
+                    if self._env.get(n) else None) for n in names}
 
     # ------------------------------------------------------------ lifecycle
 
@@ -562,12 +621,14 @@ class Router:
         return web.json_response({"object": "list", "data": data})
 
     async def handle_health(self, request: web.Request) -> web.Response:
+        self._reload_keys()
         return web.json_response({
             "status": "ok",
             "degenerate": self.cfg.degenerate,
             "classification": ("degraded" if (self.classifier is None
                                               or self.classifier.degraded) else "active"),
             "sessions": len(self.affinity),
+            "keys": self.key_fingerprints(),
         })
 
     def _cascade_head(self) -> Optional[ModelSpec]:
@@ -634,6 +695,7 @@ class Router:
         return web.json_response(self.status_payload(request))
 
     async def handle_chat(self, request: web.Request) -> web.StreamResponse:
+        self._reload_keys()
         done = asyncio.get_running_loop().create_future()
         task = asyncio.current_task()
         if task is not None:

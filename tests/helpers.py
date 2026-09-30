@@ -54,6 +54,7 @@ class FakeBackend:
         self.behaviors = behaviors
         self.native = native            # "", "ollama", "llamacpp", "lmstudio"
         self.calls: list[dict] = []     # every chat body received
+        self.auth: list[str] = []       # the Authorization header of each chat call
         self.per_model_calls: dict[str, int] = {}
         self.runner = None
         self.port = 0
@@ -63,6 +64,7 @@ class FakeBackend:
     async def chat(self, request: web.Request) -> web.StreamResponse:
         body = await request.json()
         self.calls.append(body)
+        self.auth.append(request.headers.get("Authorization", ""))
         model = body.get("model", "")
         idx = self.per_model_calls.get(model, 0)
         self.per_model_calls[model] = idx + 1
