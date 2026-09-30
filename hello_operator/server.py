@@ -938,6 +938,23 @@ class Router:
                     return web.json_response(payload, status=client_resp.status,
                                              headers=self._router_headers(
                                                  decision, routing_ms))
+                # 200 with an error IN THE BODY. A provider whose model fails
+                # answers 200 and puts {"error": {...}} in the JSON (the same
+                # shape _forward_stream already fails over on). Buffered, that
+                # was read as a valid completion with choices=None, so every
+                # auxiliary consumer raised "missing choices[0].message" and no
+                # failover ran. The refusal was deterministic on lanes with no
+                # fallback_chain (tools.approval, tools.vision_tools).
+                err = stream_error(payload)
+                if err:
+                    status = stream_error_status(err)
+                    log.warning("%s: 200 carried an error body (%s: %s); "
+                                "failing over", spec.key, status,
+                                str(err.get("message", ""))[:160])
+                    if prev is not None:
+                        spec, decision, payload, message, failures = prev
+                        break
+                    raise _RetryableStatus(status, json.dumps(err)[:2048])
             message = (payload.get("choices") or [{}])[0].get("message") or {}
             failures = []
             if props.wants_tools:
