@@ -242,12 +242,16 @@ def _candidates(entries: list[dict], s: dict) -> list[dict]:
 
 
 async def rank(http: aiohttp.ClientSession, raw_cfg: dict, keys: dict,
-               jev_cache_path: Optional[str] = None) -> dict:
+               jev_cache_path: Optional[str] = None,
+               listed: Optional[dict] = None) -> dict:
     """Rank the free models of every configured provider. Returns
     {endpoint: [ {id, score, tok_s, latency, context}, ... ]} best first.
 
     Whether a model is free and meets the requirement is JEV's call (see jev.py);
-    the old rules judge only the entries JEV could not answer for."""
+    the old rules judge only the entries JEV could not answer for.
+
+    When ``listed`` is a dict it is filled with {endpoint: ids in the provider's
+    catalogue} for every endpoint whose catalogue came back, for apply_ranking."""
     s = settings(raw_cfg)
     js = jev.settings(raw_cfg)
     cache = jev.cache_load(jev_cache_path) if js["enabled"] else {}
@@ -258,7 +262,10 @@ async def rank(http: aiohttp.ClientSession, raw_cfg: dict, keys: dict,
         pool = keys.get(endpoint) or [""]
         pool = [pool] if isinstance(pool, str) else list(pool)
         rows = []
-        entries = _candidates(await _catalogue(http, endpoint, pool[0]), s)
+        catalogue = await _catalogue(http, endpoint, pool[0])
+        if listed is not None and catalogue:
+            listed[endpoint.rstrip("/")] = {str(e.get("id")) for e in catalogue}
+        entries = _candidates(catalogue, s)
         verdicts, counts = ({}, {}) if not js["enabled"] else \
             await jev.judge(http, entries, js, cache)
         picked, by_rules = [], 0
@@ -315,11 +322,14 @@ def _key_for(endpoint: str, model_id: str, taken: set[str]) -> str:
     return name
 
 
-def apply_ranking(config_path: str, ranked: dict, raw_cfg: dict) -> tuple[bool, str]:
+def apply_ranking(config_path: str, ranked: dict, raw_cfg: dict,
+                  listed: Optional[dict] = None) -> tuple[bool, str]:
     """Rewrite the free half of every non-vision cascade. Returns (changed, note).
 
     Paid entries keep their order and follow the free block. The file is only
     replaced when the result parses and every cascade entry resolves to a model.
+    ``listed`` ({endpoint: catalogue ids}, from rank) lets it drop free models
+    the provider has removed, from every cascade including vision.
     """
     cfg = yaml.safe_load(open(config_path)) or {}
     models: dict = dict(cfg.get("models") or {})
@@ -383,11 +393,28 @@ def apply_ranking(config_path: str, ranked: dict, raw_cfg: dict) -> tuple[bool, 
         # cascade down to the paid tail and start spending money silently.
         return False, "refused: no usable free models discovered (previous cascade kept)"
 
+    def _delisted(m: dict) -> bool:
+        # Gone from a catalogue we did fetch. A catalogue that failed to load says
+        # nothing, so its models are kept.
+        ids = (listed or {}).get(str(m.get("endpoint", "")).rstrip("/"))
+        return ids is not None and str(m.get("id")) not in ids
+
     ranked_ids = {row["id"] for rows in ranked.values() for row in rows}
     changed = False
     for role, spec in roles.items():
         cascade = list((spec or {}).get("cascade") or [])
-        if not cascade or role == "vision":
+        if cascade and role == "vision":
+            # The vision order is the owner's (directive 2026-09-29): only a model
+            # the provider no longer lists comes out.
+            kept = [k for k in cascade
+                    if not (k in models and _model_free(models[k]) and _delisted(models[k]))]
+            if kept != cascade:
+                log.info("ranking: vision: dropped %s, no longer listed by the provider",
+                         ", ".join(k for k in cascade if k not in kept))
+                roles[role] = {**(spec or {}), "cascade": kept}
+                changed = True
+            continue
+        if not cascade:
             continue
         paid_tail = [k for k in cascade
                      if k in models and models[k].get("id") not in ranked_ids
@@ -396,10 +423,14 @@ def apply_ranking(config_path: str, ranked: dict, raw_cfg: dict) -> tuple[bool, 
         # forbidden (403), timed out -- is UNKNOWN, not bad. Dropping it lets one
         # transient cap quietly shrink the cascade, which is how a fleet ends up
         # one outage away from the paid tail. Keep it, below everything proven.
+        # But not once the provider has removed it: kept that way, four deleted
+        # OpenRouter models answered 404 on every failing turn for a day
+        # (2026-10-06/07).
         unproven = [k for k in cascade
                     if k in models and k not in free_keys
                     and _model_free(models[k])
                     and models[k].get("id") not in ranked_ids
+                    and not _delisted(models[k])
                     and not (deny and any(d in str(models[k].get("id", "")).lower()
                                           for d in deny))]
         if unproven:

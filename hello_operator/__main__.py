@@ -86,14 +86,16 @@ async def _rank_free(cfg: Config, apply: bool) -> int:
     if not ranking.settings(raw).get("provider_order"):
         print("ranking.provider_order is empty — nothing to rank")
         return 0
+    listed: dict = {}
     async with aiohttp.ClientSession() as http:
         ranked = await ranking.rank(http, raw, keys,
-                                    jev_cache_path=str(cfg.state_path("jev_verdicts.json")))
+                                    jev_cache_path=str(cfg.state_path("jev_verdicts.json")),
+                                    listed=listed)
     print(ranking.format_report(ranked))
     if not apply:
         print("\n(report only — pass --apply to rewrite the cascades)")
         return 0
-    changed, note = ranking.apply_ranking(cfg.source_path, ranked, raw)
+    changed, note = ranking.apply_ranking(cfg.source_path, ranked, raw, listed)
     print(f"\n{'changed' if changed else 'unchanged'}: {note}")
     return 0
 
