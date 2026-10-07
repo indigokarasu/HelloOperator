@@ -54,6 +54,7 @@ def _reset():
     server_mod._KEY_NEXT.clear()
     server_mod._KEY_COOLDOWN.clear()
     server_mod._FREE_EXHAUSTED.clear()
+    server_mod._HOLD.clear()
 
 
 def test_pool_resolves_from_env_and_drops_unset(tmp_path, monkeypatch):
@@ -128,7 +129,10 @@ def test_refused_key_retries_same_model_on_next_key_then_is_set_aside(tmp_path, 
     assert "key-a" not in json.dumps(status) and "key-b" not in json.dumps(status)
 
 
-def test_every_key_refused_falls_through_to_the_last_resort(tmp_path, monkeypatch):
+def test_every_key_refused_is_not_asked_again_by_the_last_resort(tmp_path, monkeypatch):
+    """Both accounts refused moments ago in this same turn; asking them again as
+    the last resort only doubles the load on a provider that is already
+    refusing (2026-10-07). The turn fails after one ask per key."""
     _reset()
     cfg = _cfg(tmp_path, monkeypatch)
 
@@ -144,8 +148,7 @@ def test_every_key_refused_falls_through_to_the_last_resort(tmp_path, monkeypatc
 
     status, payload, _ = run(scenario2())
     assert status == 502, payload
-    # both accounts in rotation, then both again as the last resort
-    assert sorted(backend_auths) == ["key-a", "key-a", "key-b", "key-b"], backend_auths
+    assert sorted(backend_auths) == ["key-a", "key-b"], backend_auths
 
 
 def test_paid_402_sets_aside_only_paid_calls_on_that_key():

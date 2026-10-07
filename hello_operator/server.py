@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import time
 import uuid
 from urllib.parse import urlparse
@@ -95,6 +96,68 @@ _KEY_COOLDOWN: dict[tuple[str, str], float] = {}     # (quota_key, scope) -> unt
 _KEY_COOLDOWN_S = {401: 600.0, 403: 600.0, 402: 900.0, 429: 60.0}
 _ROTATE_ON = (401, 402, 403, 429)
 
+# --- provider-stated waits (2026-10-07) ------------------------------------
+# A refusal that says how long to wait is believed, by routing AND by the last
+# resort. Before this the last resort ignored every cooldown, so each failing
+# turn re-sent ~30 requests to backends that had just answered 429 -- including
+# OpenRouter accounts whose daily free cap resets at midnight UTC -- and Nous
+# started answering "too many refused requests for this credential; back off".
+_HOLD: dict[tuple[str, str], float] = {}             # (quota_key, scope) -> until
+_BACKOFF_S = 120.0       # "back off" with no duration given
+_MAX_WAIT_S = 86400.0
+_RE_RETRY_AFTER = re.compile(r'"retry_after"\s*:\s*"?([0-9]+(?:\.[0-9]+)?)')
+_RE_RESET = re.compile(r'"X-RateLimit-Reset"\s*:\s*"?([0-9]+(?:\.[0-9]+)?)', re.I)
+
+
+def _seconds_until(value) -> Optional[float]:
+    """A reset given as epoch milliseconds (OpenRouter), epoch seconds, or a delta."""
+    try:
+        x = float(value)
+    except (TypeError, ValueError):
+        return None
+    if x > 1e12:
+        return x / 1000.0 - time.time()
+    if x > 1e9:
+        return x - time.time()
+    return x
+
+
+def _stated_wait(headers, detail: str) -> Optional[float]:
+    """Seconds the provider asked us to wait before calling again, or None.
+
+    Reads the Retry-After and X-RateLimit-Reset headers, the same reset inside
+    OpenRouter's error metadata, Nous's ``retry_after`` field, and a bare "back
+    off". The longest stated wait wins; it is capped at a day."""
+    waits = []
+    h = headers or {}
+    for v in (h.get("Retry-After"), h.get("X-RateLimit-Reset")):
+        if v:
+            waits.append(_seconds_until(v))
+    text = detail or ""
+    for rx in (_RE_RETRY_AFTER, _RE_RESET):
+        m = rx.search(text)
+        if m:
+            waits.append(_seconds_until(m.group(1)))
+    if "back off" in text.lower():
+        waits.append(_BACKOFF_S)
+    waits = [w for w in waits if w is not None and w > 0]
+    return min(max(waits), _MAX_WAIT_S) if waits else None
+
+
+def on_hold(spec, key: str) -> bool:
+    """True while the provider's own stated wait for this call has not passed."""
+    now = time.monotonic()
+    qk = quota_key(spec.endpoint, key)
+    # The shared ':free' quota has its own scope: stealth models keep their own
+    # limits and must not wait out a spent daily free cap.
+    scopes = _key_scopes(spec) + (("free-quota",) if _shares_free_quota(spec) else ())
+    return any(_HOLD.get((qk, s), 0.0) > now for s in scopes)
+
+
+def account_refusal(status: int, detail: str = "") -> bool:
+    """A refusal that applies to every model on the key, not just this one."""
+    return status in (401, 402, 403) or (status == 429 and not model_scoped_429(detail))
+
 
 def _key_scopes(spec) -> tuple[str, ...]:
     """The cooldown scopes a call to ``spec`` is subject to."""
@@ -118,6 +181,8 @@ def key_cooling(spec, key: str) -> bool:
     qk = quota_key(spec.endpoint, key)
     if _shares_free_quota(spec) and free_exhausted(qk):
         return True
+    if on_hold(spec, key):
+        return True
     return any(_KEY_COOLDOWN.get((qk, s), 0.0) > now for s in _key_scopes(spec))
 
 
@@ -131,22 +196,31 @@ def model_scoped_429(detail: str) -> bool:
     return "upstream" in d or "this model" in d
 
 
-def set_key_aside(spec, key: str, status: int, detail: str = "") -> None:
+def set_key_aside(spec, key: str, status: int, detail: str = "",
+                  wait_s: Optional[float] = None) -> None:
     qk = quota_key(spec.endpoint, key)
     # A throttled model is not an exhausted account. Reading every free 429 as
     # the account's quota skipped all the other free models on the key for 15
     # minutes: a rate-limited gemma sent screenshots to the local model while a
     # free model that reads them well sat one position behind it (2026-09-29).
     model_only = status == 429 and model_scoped_429(detail)
-    if status in (402, 429) and _shares_free_quota(spec) and not model_only:
-        mark_free_exhausted(qk)
+    free_quota = status in (402, 429) and _shares_free_quota(spec) and not model_only
+    if free_quota:
+        mark_free_exhausted(qk, wait_s)
+    if wait_s:
+        scope = (f"model:{spec.id}" if model_only else
+                 "free-quota" if free_quota else _refusal_scope(spec, status))
+        _HOLD[(qk, scope)] = time.monotonic() + wait_s
+        log.warning("%s: provider asked for a %.0fs wait (%s); holding off",
+                    spec.key, wait_s, scope)
     if status in _ROTATE_ON and (len(getattr(spec, "api_keys", None) or []) > 1
                                  or model_only):
         scope = _refusal_scope(spec, status)
-        _KEY_COOLDOWN[(qk, scope)] = time.monotonic() + _KEY_COOLDOWN_S[status]
+        cool = max(wait_s or 0.0, _KEY_COOLDOWN_S[status])
+        _KEY_COOLDOWN[(qk, scope)] = time.monotonic() + cool
         log.warning("%s: key %d/%d answered %s; set aside (%s) for %.0fs",
                     spec.key, key_slot(spec, key), len(spec.api_keys), status, scope,
-                    _KEY_COOLDOWN_S[status])
+                    cool)
 
 
 def key_slot(spec, key: str) -> int:
@@ -185,6 +259,12 @@ def mark_free_exhausted(endpoint: str, cooldown: float | None = None) -> None:
     _FREE_EXHAUSTED[endpoint] = time.monotonic() + (cooldown or _FREE_COOLDOWN_S)
     log.warning("free tier on %s looks exhausted; skipping its other free models "
                 "for %.0fs", endpoint, cooldown or _FREE_COOLDOWN_S)
+
+
+def clear_free_exhausted(endpoint: str) -> None:
+    """A free model on this account just served, so the breaker's guess is stale."""
+    if _FREE_EXHAUSTED.pop(endpoint, None):
+        log.info("free tier on %s is serving again; breaker cleared", endpoint)
 
 
 @dataclass
@@ -802,6 +882,7 @@ class Router:
     async def _try_candidates(self, request, body, props, decision, st,
                               candidates, stream, buffered, routing_ms):
         last_error = "no candidates"
+        asked: set[tuple[str, str]] = set()   # (model key, api key) tried this turn
         for i, (spec, role, pos) in enumerate(candidates):
             _refusal = self._budget_refusal(spec, props, decision)
             if _refusal:
@@ -833,6 +914,7 @@ class Router:
                 else:
                     decision.spec = kspec
                 decision.key_slot = key_slot(spec, key)
+                asked.add((spec.key, key))
                 try:
                     if stream and not buffered:
                         return await self._forward_stream(request, body, props,
@@ -848,7 +930,7 @@ class Router:
                     break
                 except _RetryableStatus as e:
                     last_error = f"{spec.key}: backend returned {e.status}"
-                    set_key_aside(spec, key, e.status, e.detail)
+                    set_key_aside(spec, key, e.status, e.detail, e.wait_s)
                     if e.status not in _ROTATE_ON:
                         break
         # Last resort: everything was skipped or failed, and we are about to
@@ -856,11 +938,19 @@ class Router:
         # certain 502 is strictly worse than one more try at a backend whose
         # only disqualification was a cooldown or a spent budget. This cannot
         # spend money: paid specs are excluded, not merely deprioritized.
+        # It skips what this turn already asked (it answered moments ago), what
+        # the provider said to wait for, and the rest of an account once that
+        # account refuses again: on 2026-10-07 retrying everything re-sent ~30
+        # requests per failing turn and kept Nous throttling the key.
         retried = False
+        refused: set[str] = set()   # quota keys that refused during the last resort
         for spec, role, pos in candidates:
             if not _is_free(spec) or _denied(spec, self.cfg.settings.denylist):
                 continue
             for key in keys_in_turn(spec, skip_cooling=False):
+                qk = quota_key(spec.endpoint, key)
+                if (spec.key, key) in asked or qk in refused or on_hold(spec, key):
+                    continue
                 retried = True
                 decision = Decision(spec=_with_key(spec, key), role=role, pos=pos,
                                     kind="last-resort", trigger="all-candidates-failed",
@@ -870,13 +960,22 @@ class Router:
                             spec.key, last_error)
                 try:
                     if stream and not buffered:
-                        return await self._forward_stream(request, body, props,
+                        resp = await self._forward_stream(request, body, props,
                                                           decision, st, routing_ms)
-                    return await self._forward_buffered(request, body, props, decision,
-                                                        st, routing_ms, emit_stream=stream)
-                except (aiohttp.ClientError, asyncio.TimeoutError, OSError,
-                        _RetryableStatus) as e:
+                    else:
+                        resp = await self._forward_buffered(request, body, props, decision,
+                                                            st, routing_ms,
+                                                            emit_stream=stream)
+                    clear_free_exhausted(qk)
+                    return resp
+                except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
                     last_error = f"{spec.key}: {e.__class__.__name__}: {e}"
+                    continue
+                except _RetryableStatus as e:
+                    last_error = f"{spec.key}: {e.__class__.__name__}: {e}"
+                    set_key_aside(spec, key, e.status, e.detail, e.wait_s)
+                    if account_refusal(e.status, e.detail):
+                        refused.add(qk)
                     continue
         if retried:
             last_error += " (free backends retried as a last resort and still failed)"
@@ -923,8 +1022,9 @@ class Router:
                     if prev is not None:
                         spec, decision, payload, message, failures = prev
                         break
-                    raise _RetryableStatus(client_resp.status,
-                                           await _error_detail(client_resp))
+                    detail = await _error_detail(client_resp)
+                    raise _RetryableStatus(client_resp.status, detail,
+                                           _stated_wait(client_resp.headers, detail))
                 try:
                     payload = await client_resp.json(content_type=None)
                 except (ValueError, aiohttp.ClientError):
@@ -1028,7 +1128,8 @@ class Router:
         if client_resp.status >= 500 or client_resp.status in _RETRYABLE_STATUSES:
             detail = await _error_detail(client_resp)
             client_resp.close()
-            raise _RetryableStatus(client_resp.status, detail)
+            raise _RetryableStatus(client_resp.status, detail,
+                                   _stated_wait(client_resp.headers, detail))
         collector = StreamCollector()
         headers = self._router_headers(decision, routing_ms)
         if client_resp.status >= 400:
@@ -1061,7 +1162,8 @@ class Router:
             status = stream_error_status(err)
             log.warning("%s: stream opened with a backend error (%s: %s); failing over",
                         spec.key, status, str(err.get("message", ""))[:160])
-            raise _RetryableStatus(status, json.dumps(err)[:2048])
+            detail = json.dumps(err)[:2048]
+            raise _RetryableStatus(status, detail, _stated_wait({}, detail))
 
         resp = web.StreamResponse(status=client_resp.status)
         resp.headers["Content-Type"] = client_resp.headers.get(
@@ -1318,9 +1420,11 @@ class Router:
 
 
 class _RetryableStatus(Exception):
-    def __init__(self, status: int, detail: str = ""):
+    def __init__(self, status: int, detail: str = "", wait_s: Optional[float] = None):
+        super().__init__(status, detail)   # str() unchanged by the extra field
         self.status = status
         self.detail = detail   # start of the error body; says whose limit a 429 is
+        self.wait_s = wait_s   # how long the provider asked us to wait, if it said
 
 
 async def _error_detail(client_resp: aiohttp.ClientResponse) -> str:
